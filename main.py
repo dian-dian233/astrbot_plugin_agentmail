@@ -35,15 +35,32 @@ try:  # 插件包内导入
     from .attach import attachment_block, download_attachments
     from .mailer import MailError, Mailer
     from .notify import render_notice
+    from .search import (
+        LOCAL_FALLBACK_FETCH,
+        USAGE as SEARCH_USAGE,
+        format_results as format_search_results,
+        local_search,
+        parse_args as parse_search_args,
+        sort_desc,
+    )
 except ImportError:  # 单独运行 / 被平铺加载时
     from attach import attachment_block, download_attachments  # type: ignore[no-redef]
     from mailer import MailError, Mailer  # type: ignore[no-redef]
     from notify import render_notice  # type: ignore[no-redef]
+    from search import (  # type: ignore[no-redef]
+        LOCAL_FALLBACK_FETCH,
+        USAGE as SEARCH_USAGE,
+        format_results as format_search_results,
+        local_search,
+        parse_args as parse_search_args,
+        sort_desc,
+    )
 
 HELP = """AgentMail 邮件工具
 · /mail send <收件人> <主题> | <正文>
   例：/mail send 123@qq.com 明天见 | 我去不了，饭钱转你了
 · /mail list [数量]   查收件箱
+· /mail search <关键词> [数量]   搜历史邮件（关键词可带空格，数量 1-100）
 · /mail read <id>     看某一封
 · /mail whoami        看当前邮箱和连通状态
 · /mail here          打印当前会话 ID（填「收信推送」用）
@@ -269,6 +286,27 @@ class AgentMailPlugin(Star):
             warn=logger.warning,
         )
 
+    # ── 搜索（v0.4.0）────────────────────────────────────────
+    async def _search_mail(self, keyword: str, count: int):
+        """走 AgentMail search 接口；接口不可用就降级成「最近 N 封本地过滤」。
+
+        返回 `(messages, note)`，note 是给用户看的降级说明（没降级就是空串）。
+        """
+        mailer = self._mailer_or_raise()
+        try:
+            msgs = await asyncio.to_thread(mailer.search, keyword, count)
+            return sort_desc(msgs)[:count], ""
+        except MailError as e:
+            # 接口不支持 / 参数不被接受 / 老部署没有这个路由 → 本地过滤兜底
+            logger.warning(f"[agentmail] 搜索接口不可用，降级为本地过滤最近邮件：{e}")
+            fetch = max(LOCAL_FALLBACK_FETCH, min(50, count))
+            recent = await asyncio.to_thread(mailer.list, fetch)
+            hits = local_search(recent, keyword, count)
+            return (
+                hits,
+                f"（搜索接口不可用，已降级为在最近 {len(recent)} 封里本地过滤）",
+            )
+
     # ── 指令 ────────────────────────────────────────────────
     # 不声明任何参数：AstrBot 的参数解析器会把 *args 的 annotation（inspect empty）
     # 当成类型去调用，导致 `_empty() takes no arguments`。参数自己解析最省事。
@@ -294,6 +332,15 @@ class AgentMailPlugin(Star):
                 res = await asyncio.to_thread(self._mailer_or_raise().send, to, subject, body)
                 mid = res.get("message_id", "?")
                 yield event.plain_result(f"发出去了：{', '.join(to)}\n主题：{subject}\nid：{mid}")
+            elif action in ("search", "搜", "搜索", "查找"):
+                keyword, count = parse_search_args(rest)
+                if not keyword:
+                    # 空关键词给用法，不抛异常、也不浪费一次接口请求
+                    yield event.plain_result(SEARCH_USAGE)
+                    return
+                found, note = await self._search_mail(keyword, count)
+                text = format_search_results(keyword, found)
+                yield event.plain_result(f"{text}\n{note}" if note else text)
             elif action in ("list", "收件箱", "inbox"):
                 limit = int(rest) if rest.isdigit() else 5
                 msgs = await asyncio.to_thread(self._mailer_or_raise().list, limit)

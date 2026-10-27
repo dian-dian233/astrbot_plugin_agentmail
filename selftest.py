@@ -4,6 +4,8 @@
       + v0.3.0 推送模板：默认模板与 v0.2.0 逐字一致 / 自定义模板渲染 / 非法模板回退不抛异常
       + v0.4.0 附件随推送：清单格式 / 有附件发真文件 / 无附件行为不变 /
         下载失败降级 / 适配器不支持文件降级 / 临时目录清理
+      + v0.4.0 /mail search：参数解析 / 时间倒序 / 空关键词用法 / 无结果文案 /
+        接口不支持降级本地过滤
 
 用法：
     PYTHONDONTWRITEBYTECODE=1 python3 selftest.py            # 含真实 API 抽查（没网/没 key 会自动跳过）
@@ -112,6 +114,13 @@ try:
     from astrbot_plugin_agentmail.mailer import MailError  # noqa: E402
     from astrbot_plugin_agentmail.main import AgentMailPlugin  # noqa: E402
     from astrbot_plugin_agentmail.notify import render_notice  # noqa: E402
+    from astrbot_plugin_agentmail.search import (  # noqa: E402
+        USAGE as SEARCH_USAGE,
+        format_results as format_search_results,
+        local_search,
+        parse_args as parse_search_args,
+        sort_desc,
+    )
 except ImportError:  # 仓库根目录直接跑
     from attach import (  # noqa: E402
         attachment_block,
@@ -123,6 +132,13 @@ except ImportError:  # 仓库根目录直接跑
     from mailer import MailError  # noqa: E402
     from main import AgentMailPlugin  # noqa: E402
     from notify import render_notice  # noqa: E402
+    from search import (  # noqa: E402
+        USAGE as SEARCH_USAGE,
+        format_results as format_search_results,
+        local_search,
+        parse_args as parse_search_args,
+        sort_desc,
+    )
 
 
 class FakeEvent:
@@ -194,6 +210,24 @@ class FakeAttachMailer(FakeMailer):
         with open(dest_path, "wb") as f:
             f.write(self.BLOB)
         return len(self.BLOB)
+
+
+class FakeSearchMailer(FakeMailer):
+    """假搜索：故意按“相关度”乱序返回，时间倒序得靠插件自己排。"""
+
+    def __init__(self, messages, unsupported=False, hits=None):
+        super().__init__(messages)
+        self.unsupported = unsupported
+        self.hits = hits
+        self.searched = []
+
+    def search(self, query, limit=20):
+        if self.unsupported:
+            raise MailError("HTTP 400：不支持 q 参数", 400)
+        self.searched.append((query, limit))
+        data = self.messages if self.hits is None else self.hits
+        order = [2, 0, 1] if len(data) >= 3 else list(range(len(data)))
+        return [data[i] for i in order][:limit]
 
 
 class RecordingContext(FakeContext):
@@ -388,6 +422,118 @@ def test_notify_template():
     print("④ _compose_notice 走配置：自定义模板 / 空配置 / 非法模板（回退+warning）三种都对 ✅")
 
 
+def s_mail(mid, subject, ts, frm="boss@corp.com", preview="正文预览"):
+    m = mail(mid, subject, frm=frm, preview=preview)
+    m["timestamp"] = ts
+    return m
+
+
+def test_search_helpers():
+    """v0.4.0 功能②：搜索参数解析 / 排序 / 本地降级过滤（纯函数）。"""
+    print("\n── 搜索（v0.4.0 纯函数）──")
+
+    # 关键词 + 数量
+    assert parse_search_args("发票 5") == ("发票", 5)
+    assert parse_search_args("  年度 总结 3 ") == ("年度 总结", 3), parse_search_args("  年度 总结 3 ")
+    assert parse_search_args("发票") == ("发票", 10)
+    assert parse_search_args("") == ("", 10)
+    assert parse_search_args("2026") == ("2026", 10), "单个纯数字要当关键词，不能瞎猜成数量"
+    assert parse_search_args("发票 999") == ("发票", 100), "数量要夹到 1-100"
+    assert parse_search_args("发票 0") == ("发票", 1)
+    assert "用法" in SEARCH_USAGE
+    print("   ① 参数解析：正常 / 带空格关键词 / 缺数量 / 空串 / 纯数字 / 越界夹取 ✅")
+
+    # 时间倒序
+    msgs = [
+        s_mail("id-old", "早的", "2026-10-01T09:00:00.000Z"),
+        s_mail("id-new", "最新的", "2026-10-27T10:00:00.000Z"),
+        s_mail("id-mid", "中间的", "2026-10-15T12:00:00.000Z"),
+        {"message_id": "id-broken", "subject": "没时间字段"},
+    ]
+    assert [m["message_id"] for m in sort_desc(msgs)] == ["id-new", "id-mid", "id-old", "id-broken"]
+    # 本地降级过滤：主题 / 发件人 / 正文都能命中，大小写不敏感，且结果仍按时间倒序
+    inv = [
+        s_mail("a", "季度发票", "2026-10-02T00:00:00.000Z"),
+        s_mail("b", "无关邮件", "2026-10-03T00:00:00.000Z"),
+        s_mail("c", "转发：发票", "2026-10-04T00:00:00.000Z"),
+        s_mail("d", "别人发的", "2026-10-05T00:00:00.000Z", frm="INVOICE@Corp.com", preview="啥也没有"),
+    ]
+    hits = local_search(inv, "发票", 10)
+    assert [m["message_id"] for m in hits] == ["c", "a"], hits
+    assert [m["message_id"] for m in local_search(inv, "invoice", 10)] == ["d"]
+    assert len(local_search(inv, "发票", 1)) == 1, "数量要生效"
+    assert local_search(inv, "", 10) == [] and local_search(inv, "根本没有", 10) == []
+    print("   ② 时间倒序 + 本地子串过滤（主题/发件人/正文，大小写不敏感）✅")
+
+    # 空结果文案
+    empty = format_search_results("发票", [])
+    assert "没搜到包含「发票」的邮件" in empty, empty
+    one = format_search_results("发票", [s_mail("id-1", "季度发票", "2026-10-02T03:04:05.000Z")])
+    assert "找到 1 封" in one and "2026-10-02 03:04:05" in one and "boss@corp.com" in one and "id-1" in one, one
+    print("   ③ 输出格式：时间 · 发件人 · 主题 + message_id；空结果有明确文案 ✅")
+
+
+async def collect(handler, evt):
+    out = []
+    async for r in handler(evt):
+        out.append(r)
+    return out
+
+
+async def test_search_command():
+    """v0.4.0 功能②：/mail search 指令（离线假 mailer）。"""
+    print("\n── /mail search（v0.4.0 集成）──")
+    msgs = [
+        s_mail("id-1", "季度发票", "2026-10-02T10:00:00.000Z"),
+        s_mail("id-2", "无关邮件", "2026-10-03T10:00:00.000Z"),
+        s_mail("id-3", "转发：年度发票", "2026-10-27T10:00:00.000Z"),
+    ]
+
+    # ④ 正常搜索：时间倒序 + 数量生效 + id 打出来
+    p = AgentMailPlugin(FakeContext(), conf())
+    p._mailer = FakeSearchMailer(msgs)
+    out = await collect(p.mail, FakeEvent("/mail search 发票 2"))
+    text = "\n".join(out)
+    assert p._mailer.searched == [("发票", 2)], p._mailer.searched
+    assert "找到 2 封" in text, text
+    assert text.index("id-3") < text.index("id-1"), f"必须先新后旧：{text}"
+    assert "id-2" not in text, "无关邮件不该出现"
+    assert "→ notice" not in text and "2026-10-27 10:00:00 · boss@corp.com · 转发：年度发票" in text, text
+    print("   ④ 正常：搜到 2 封，按时间倒序（id-3 在 id-1 前），无关邮件被排除 ✅")
+
+    # ⑤ 空关键词：给用法提示，不抛异常，也不打接口
+    p2 = AgentMailPlugin(FakeContext(), conf())
+    p2._mailer = FakeSearchMailer(msgs)
+    out2 = await collect(p2.mail, FakeEvent("/mail search"))
+    assert any("用法：/mail search" in r for r in out2), out2
+    assert p2._mailer.searched == [], "空关键词不该请求接口"
+    out2b = await collect(p2.mail, FakeEvent("/mail search    "))  # 只有空格
+    assert any("用法" in r for r in out2b), out2b
+    # 纯数字关键词不瞎猜成数量：`/mail search 2026` 是搜「2026」
+    out2c = await collect(p2.mail, FakeEvent("/mail search 2026"))
+    assert p2._mailer.searched[-1] == ("2026", 10), p2._mailer.searched
+    print("   ⑤ 空关键词 → 用法提示（零异常、零请求）✅")
+
+    # ⑥ 无结果：明确文案
+    p3 = AgentMailPlugin(FakeContext(), conf())
+    p3._mailer = FakeSearchMailer(msgs, hits=[])
+    out3 = await collect(p3.mail, FakeEvent("/mail search 发票"))
+    assert any("没搜到包含「发票」的邮件" in r for r in out3), out3
+    print("   ⑥ 无结果 → 「没搜到包含「发票」的邮件」✅")
+
+    # ⑦ 接口不支持（HTTP 400）→ 降级为本地过滤最近 N 封
+    p4 = AgentMailPlugin(FakeContext(), conf())
+    p4._mailer = FakeSearchMailer(msgs, unsupported=True)
+    WARNINGS.clear()
+    out4 = await collect(p4.mail, FakeEvent("/mail search 发票 5"))
+    text4 = "\n".join(out4)
+    assert "已降级为在最近 3 封里本地过滤" in text4, text4
+    assert "id-3" in text4 and "id-1" in text4 and "id-2" not in text4, text4
+    assert text4.index("id-3") < text4.index("id-1"), text4
+    assert any("搜索接口不可用" in w for w in WARNINGS), WARNINGS
+    print("   ⑦ 接口不支持 → 降级本地过滤（仍时间倒序）+ warning + 明确提示 ✅")
+
+
 def test_attachment_helpers():
     """v0.4.0 功能①：附件纯函数（不碰网络）。"""
     print("\n── 附件（v0.4.0 纯函数）──")
@@ -578,6 +724,10 @@ async def main():
     # ── v0.4.0 附件随推送 ──
     test_attachment_helpers()
     await test_attachment_push()
+
+    # ── v0.4.0 /mail search ──
+    test_search_helpers()
+    await test_search_command()
 
     print("\n全部断言通过 ✅")
 

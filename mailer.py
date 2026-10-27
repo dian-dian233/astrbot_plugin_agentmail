@@ -127,8 +127,27 @@ class Mailer:
             payload["text"] = "（无正文）"
         return self.request(f"/inboxes/{self.inbox}/messages/send", "POST", payload)
 
-    def list(self, limit: int = 5) -> list[dict]:
-        data = self.request(f"/inboxes/{self.inbox}/messages?limit={max(1, min(50, int(limit)))}")
+    def list(self, limit: int = 5, labels=None) -> list[dict]:
+        """列收件箱（最新在前）。`labels` 可传 ["unread"] 只取未读（接口原生支持）。"""
+        size = max(1, min(50, int(limit)))
+        path = f"/inboxes/{self.inbox}/messages?limit={size}"
+        labels = _as_list(labels)
+        if labels:
+            path += "&labels=" + urllib.parse.quote(",".join(labels), safe="")
+        data = self.request(path)
+        return data.get("messages") or data.get("data") or []
+
+    def search(self, query: str, limit: int = 20) -> list[dict]:
+        """全文搜索（发件人 / 收件人 / 主题子串 + 正文分词）。
+
+        结果按**相关度**返回，要按时间倒序得调用方自己排（见 search.sort_desc）。
+        关键词为空直接抛 MailError（接口对空 q 会 400），别浪费一次请求。
+        """
+        q = (query or "").strip()
+        if not q:
+            raise MailError("搜索关键词为空")
+        size = max(1, min(100, int(limit or 20)))  # 上限 100，超了接口直接 400
+        data = self.request(f"/inboxes/{self.inbox}/messages/search?q={_q(q)}&limit={size}")
         return data.get("messages") or data.get("data") or []
 
     def read(self, message_id: str) -> dict:

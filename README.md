@@ -52,6 +52,7 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 ```
 /mail send <收件人> <主题> | <正文>
 /mail list [数量]
+/mail search <关键词> [数量]     # 搜历史邮件（v0.4.0）
 /mail read <message_id>
 /mail whoami
 /mail here            # 打印当前会话 ID，填收信推送用
@@ -120,6 +121,19 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 ```
 
 多个收件人用英文逗号：`a@x.com,b@y.com`。
+
+## 邮件搜索（v0.4.0）
+
+```
+/mail search 发票          # 搜关键词，默认返回 10 封
+/mail search 年度 总结 3    # 关键词可以带空格，最后一个是数字就当年数量
+```
+
+- 结果**按时间倒序**，每条给「时间 · 发件人 · 主题」，下一行是 `message_id`，直接 `/mail read <id>` 看正文
+- 关键词为空只回用法提示，不报错、不发请求
+- 搜不到会明确说「没搜到包含「xxx」的邮件」
+- 走 AgentMail 的 `GET /v0/inboxes/{inbox}/messages/search?q=...&limit=1-100`（`q` 必填、`limit` 上限 100、结果是相关度排序所以插件自己重排成时间倒序）
+- 万一这个接口不可用（老部署没这路由 / 参数被拒），会自动**降级成「在最近 N 封里本地过滤」**，并在回复里注明降级了
 
 ## 附件随推送（v0.4.0）
 
