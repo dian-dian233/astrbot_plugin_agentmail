@@ -51,11 +51,53 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 ```
 /mail send <收件人> <主题> | <正文>
 /mail list [数量]
+/mail search <关键词> [数量]   # 搜历史邮件（主题/发件人/正文），默认 5 条、最多 20
 /mail read <message_id>
 /mail whoami
 /mail here            # 打印当前会话 ID，填收信推送用
 /mail poll            # 手动跑一次收信轮询
 ```
+
+## 搜索历史邮件（v0.4.0）
+
+收件箱翻不过来，直接搜关键词：
+
+```
+/mail search 老登          # 搜「老登」，默认回 5 条
+/mail search 报告 3        # 搜「报告」，最多 3 条
+```
+
+搜的范围：**主题 / 发件人 / 正文预览**，大小写不敏感（`Welcome` 能搜到 `welcome`），
+中文直接搜（不走词边界，`老登` 能命中「老登，你太美」）。结果用**和 `/mail list`
+完全一样的行格式**（`时间 · 发件人` / 主题 / message_id，多条之间空一行）：
+
+```
+/mail search 太美
+2026-10-27T09:15:21 · 点点 <diandian233@agentmail.to>
+  老登，你太美
+  <010001a17ca48c6e-...@email.amazonses.com>
+```
+
+没搜到会明确回一句 `没搜到包含「xxx」的邮件`；关键词为空只回用法，不会去打 API。
+数量省略默认 5，范围 1~20（`abc` 之类非数字回默认 5，`-1` 夹成 1，`999` 夹成 20）。
+
+### 搜的是服务端还是本地？
+
+**默认走 AgentMail 的服务端搜索端点**（不是本地扫全量）：
+
+```
+GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
+```
+
+参数名照官方 OpenAPI（`docs.agentmail.to/openapi.json`）抄的：该 path 只有
+`q`（必填）、`limit`、`page_token`、`before`、`after` 五个 **query 参数，没有 requestBody**；
+服务端对主题/收发件人做子串匹配、对正文做全文索引，结果按相关度排序（最多 100 条）。
+
+只有当这个端点回 **400 / 404 / 405 / 422 / 501**（比如套餐或权限不支持）时，
+才自动退化为 **本地过滤**：`GET /v0/inboxes/{inbox}/messages?limit=50` 拉最近 50 封，
+再用 `search.py` 里的纯函数做大小写不敏感的 `in` 匹配（主题 / 发件人 / 正文预览 / text），
+日志里会留一条 `服务端搜索不可用（HTTP xxx），退化为 list(50) 本地过滤` 的 warning。
+401 之类真错误照常报出来，不吞。
 
 ## 收信推送（v0.2.0）
 
@@ -115,6 +157,7 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 ```
 /mail send 1150880493@qq.com 明天见 | 我这边跑完了，报告在附件里（下略）
 /mail list 3
+/mail search 报告 3
 /mail whoami
 ```
 
