@@ -65,6 +65,12 @@
     "hint": "默认 300",
     "default": 300
   },
+  "notify_template": {
+    "description": "推送文案模板（留空用内置文案）",
+    "type": "string",
+    "hint": "留空=内置文案（行为同 v0.2.0）。可用占位符：{subject} {from} {preview} {time} {inbox}，例：📮 {subject} 来自 {from} @ {time}（可多行）。写了未知占位符或花括号没闭合会自动回退内置文案并记 warning，不会报错",
+    "default": ""
+  },
   "notify_on_first_poll": {
     "description": "首次轮询是否也推送历史邮件",
     "type": "bool",

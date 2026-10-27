@@ -41,6 +41,7 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 | `poll_interval` | 轮询间隔秒数，最小 60，默认 300 |
 | `notify_sessions` | 新邮件推送到哪些会话，用 `/mail here` 拿到的 ID，一行一个 |
 | `notify_preview_len` | 推送里的正文预览字数，默认 300 |
+| `notify_template` | 推送文案模板，**留空=内置文案**。可用占位符 `{subject}` `{from}` `{preview}` `{time}` `{inbox}`；写错（未知占位符、花括号没闭合）会自动回退内置文案并记 warning，不会报错 |
 | `notify_on_first_poll` | 首次轮询是否推送历史邮件，建议保持关（首次只记基线，不刷屏） |
 
 > ⚠️ 建议保持 `allow_all=false`：邮箱是你的，别人能用了就能以你的名义发信。群聊要用就填 `allowed_groups`。
@@ -84,6 +85,30 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 ────────────
 正文预览前 300 字…
 ```
+
+### 自定义推送文案（v0.3.0）
+
+不想看内置格式，就把配置项 `notify_template` 填上自己的模板（留空＝内置文案，行为不变）：
+
+```text
+📮 新邮件｜{subject}
+来自 {from} · {time}
+收件箱 {inbox}
+────────────
+{preview}
+```
+
+换行直接在配置框里回车（多行模板没问题）。占位符只有这五个：
+
+| 占位符 | 内容 |
+| --- | --- |
+| `{subject}` | 邮件主题，空则 `(无主题)` |
+| `{from}` | 发件人，空则 `?` |
+| `{preview}` | 正文预览，仍受 `notify_preview_len` 截断（超长补 `…`） |
+| `{time}` | 时间，取前 19 位，如 `2026-10-27T10:00:00` |
+| `{inbox}` | 插件配置里的 `inbox` |
+
+模板写坏了（比如 `{foo}`、`{subject` 没闭合、`{subject!r}`）**不会报错**：自动回退内置文案，日志里留一条 warning，`[agentmail] 推送模板不可用，已回退内置文案：…`。
 
 例子：
 
