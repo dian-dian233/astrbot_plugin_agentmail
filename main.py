@@ -9,6 +9,8 @@
     /mail poll            手动跑一次收信轮询
 
 v0.2.0 新增：后台收信轮询，把新邮件推到 notify_sessions 里配置的会话/群。
+v0.3.0 新增：推送文案可配（notify_template，占位符 {subject} {from} {preview} {time} {inbox}），
+            渲染逻辑抽到 notify.py（纯标准库、可单测），模板非法时回退内置文案。
 注意：`mail` 指令**不声明任何参数**，参数直接从 event.message_str 解析。
 AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当类型调用，
 直接抛 `_empty() takes no arguments`（v0.1.0 的坑，v0.1.1 修掉）。
@@ -25,8 +27,10 @@ from astrbot.api.star import Context, Star
 
 try:  # 插件包内导入
     from .mailer import MailError, Mailer
+    from .notify import render_notice
 except ImportError:  # 单独运行 / 被平铺加载时
     from mailer import MailError, Mailer  # type: ignore[no-redef]
+    from notify import render_notice  # type: ignore[no-redef]
 
 HELP = """AgentMail 邮件工具
 · /mail send <收件人> <主题> | <正文>
@@ -169,22 +173,13 @@ class AgentMailPlugin(Star):
         return ("received" in labels) or ("unread" in labels) or not labels
 
     def _compose_notice(self, m: dict) -> str:
-        try:
-            limit = int(self.conf.get("notify_preview_len") or 300)
-        except (TypeError, ValueError):
-            limit = 300
-        frm = m.get("from") or "?"
-        body = m.get("preview") or m.get("text") or "(正文见邮件)"
-        body = str(body).replace("\n\n", "\n").strip()
-        if len(body) > limit:
-            body = body[:limit] + "…"
-        return (
-            "📬 新邮件\n"
-            f"主题：{m.get('subject', '(无主题)')}\n"
-            f"发件人：{frm}\n"
-            f"时间：{str(m.get('timestamp', ''))[:19]}\n"
-            "────────────\n"
-            f"{body}"
+        """推送文案：配了 notify_template 就按模板渲染，否则用内置文案（v0.3.0）。"""
+        return render_notice(
+            m,
+            template=self.conf.get("notify_template") or "",
+            preview_len=self.conf.get("notify_preview_len") or 300,
+            inbox=self.conf.get("inbox") or "",
+            warn=logger.warning,
         )
 
     # ── 指令 ────────────────────────────────────────────────
