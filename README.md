@@ -43,6 +43,7 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 | `notify_preview_len` | 推送里的正文预览字数，默认 300 |
 | `notify_template` | 推送文案模板，**留空=内置文案**。可用占位符 `{subject}` `{from}` `{preview}` `{time}` `{inbox}`；写错（未知占位符、花括号没闭合）会自动回退内置文案并记 warning，不会报错 |
 | `notify_on_first_poll` | 首次轮询是否推送历史邮件，建议保持关（首次只记基线，不刷屏） |
+| `notify_attachments` | 推送时是否**把附件文件一起发出去**，默认关。关着也会显示附件清单（名字+大小+类型），只是不发真文件 |
 
 > ⚠️ 建议保持 `allow_all=false`：邮箱是你的，别人能用了就能以你的名义发信。群聊要用就填 `allowed_groups`。
 
@@ -119,6 +120,39 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 ```
 
 多个收件人用英文逗号：`a@x.com,b@y.com`。
+
+## 附件随推送（v0.4.0）
+
+新邮件带附件时，推送里会多一段清单（`notify_attachments` 关着也照样有）：
+
+```
+📬 新邮件
+主题：报表来了
+发件人：boss@corp.com
+时间：2026-10-27T10:00:00
+────────────
+正文预览前 300 字…
+────────────
+📎 附件 2 个
+· Q3报表.xlsx（48.2 KB · application/vnd.openxmlformats-officedocument.spreadsheetml.sheet）
+· 截图.png（1.2 MB · image/png）
+```
+
+想让**真文件**也发到会话里，把 `notify_attachments` 打开（默认关，不影响现有用户）：
+
+- 附件会先下载到系统临时目录，再用 AstrBot 的文件消息组件
+  `astrbot.api.message_components.File(name=..., file=...)` 随文字一起发出去，发完**立刻删临时目录**
+- 单个附件上限 20 MB、每封最多取前 5 个（防止把容器磁盘塞满）
+- 下载失败 / 平台适配器不支持文件消息 → **自动降级成文字清单 + 日志 warning**，整轮推送不会因此中断
+- 清单永远显示，所以关着 `notify_attachments` 也能知道「这封有附件、叫什么、多大」
+
+用到的 AgentMail 接口（都实测核对过）：
+
+| 用途 | 接口 |
+| --- | --- |
+| 附件元信息（`attachments` 字段） | 直接来自列表 / 详情里的 message 对象 |
+| 取签名下载地址 | `GET /v0/inboxes/{inbox}/messages/{message_id}/attachments/{attachment_id}` |
+| 下载二进制 | 直接 GET 上一步返回的 `download_url`（签名 CDN 链接，**不能**再带 Authorization 头） |
 
 ## 自然语言
 

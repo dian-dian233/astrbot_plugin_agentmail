@@ -11,6 +11,10 @@
 v0.2.0 新增：后台收信轮询，把新邮件推到 notify_sessions 里配置的会话/群。
 v0.3.0 新增：推送文案可配（notify_template，占位符 {subject} {from} {preview} {time} {inbox}），
             渲染逻辑抽到 notify.py（纯标准库、可单测），模板非法时回退内置文案。
+v0.4.0 新增：
+    - 附件随推送一并送达（附件清单始终显示；notify_attachments 打开后下载真文件一起发）
+    - /mail search <关键词> [数量]
+    - 每日未读摘要（digest_enabled / digest_time / digest_sessions）
 注意：`mail` 指令**不声明任何参数**，参数直接从 event.message_str 解析。
 AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当类型调用，
 直接抛 `_empty() takes no arguments`（v0.1.0 的坑，v0.1.1 修掉）。
@@ -19,6 +23,8 @@ AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当
 import asyncio
 import contextlib
 import re
+import shutil
+import tempfile
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -26,9 +32,11 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 
 try:  # 插件包内导入
+    from .attach import attachment_block, download_attachments
     from .mailer import MailError, Mailer
     from .notify import render_notice
 except ImportError:  # 单独运行 / 被平铺加载时
+    from attach import attachment_block, download_attachments  # type: ignore[no-redef]
     from mailer import MailError, Mailer  # type: ignore[no-redef]
     from notify import render_notice  # type: ignore[no-redef]
 
@@ -133,7 +141,7 @@ class AgentMailPlugin(Star):
 
         seen = await self.get_kv_data(SEEN_KEY, []) or []
         seen = [str(x) for x in seen]
-        stats = {"new": 0, "pushed": 0, "baseline": 0}
+        stats = {"new": 0, "pushed": 0, "baseline": 0, "degraded": 0, "files": 0}
 
         if not seen and not self.conf.get("notify_on_first_poll"):
             ids = [str(m.get("message_id")) for m in incoming if m.get("message_id")]
@@ -149,17 +157,96 @@ class AgentMailPlugin(Star):
 
         for m in fresh:
             text = self._compose_notice(m)
-            for s in sessions:
-                try:
-                    await self.context.send_message(s, MessageChain([Comp.Plain(text)]))
-                    stats["pushed"] += 1
-                except Exception as e:  # noqa: BLE001 单个会话失败不影响其它
-                    logger.warning(f"[agentmail] 推送到 {s} 失败：{e}")
+            # 附件：清单已经在 text 里了（render_notice 追加的），这里按配置决定要不要发真文件
+            saved, errors, tmpdir = await self._prepare_attachments(m)
+            degrade_note = ""
+            if errors:
+                degrade_note = "\n（附件没发出去，只有上面的文字清单：%s）" % "；".join(errors)
+            try:
+                chain = [Comp.Plain(text + degrade_note)]
+                for item in saved:
+                    chain.append(self._file_component(item))
+                for s in sessions:
+                    try:
+                        await self.context.send_message(s, MessageChain(list(chain)))
+                        stats["pushed"] += 1
+                        stats["files"] += len(saved)
+                    except Exception as e:  # noqa: BLE001 单个会话失败不影响其它
+                        if not saved:
+                            logger.warning(f"[agentmail] 推送到 {s} 失败：{e}")
+                            continue
+                        # 文件消息发不出去（适配器不支持 etc.）→ 降级纯文字，整轮推送不能挂
+                        logger.warning(f"[agentmail] 带附件的推送发往 {s} 失败，降级纯文字：{e}")
+                        try:
+                            await self.context.send_message(
+                                s,
+                                MessageChain(
+                                    [
+                                        Comp.Plain(
+                                            text
+                                            + degrade_note
+                                            + "\n（附件文件发送失败，已降级为文字清单）"
+                                        )
+                                    ]
+                                ),
+                            )
+                            stats["pushed"] += 1
+                            stats["degraded"] += 1
+                        except Exception as e2:  # noqa: BLE001
+                            logger.warning(f"[agentmail] 降级纯文字也失败了 {s}：{e2}")
+            finally:
+                self._cleanup_dir(tmpdir)
 
         ids = [str(m.get("message_id")) for m in fresh if m.get("message_id")]
         await self.put_kv_data(SEEN_KEY, (ids + seen)[:SEEN_LIMIT])
         logger.info(f"[agentmail] 推送了 {len(fresh)} 封新邮件")
         return stats
+
+    # ── 附件（v0.4.0）────────────────────────────────────────
+    async def _prepare_attachments(self, m: dict):
+        """按 `notify_attachments` 配置把附件下到临时目录。
+
+        返回 `(saved, errors, tmpdir)`；`notify_attachments` 关着时直接
+        `([], [], None)`，行为与 v0.3.0 完全一致（只多一行附件清单文字）。
+        任何异常都在这里吃掉，最多让这一封的附件降级成文字清单。
+        """
+        atts = m.get("attachments")
+        if not self.conf.get("notify_attachments"):
+            return [], [], None
+        if not isinstance(atts, (list, tuple)) or not atts:
+            return [], [], None
+
+        tmpdir = None
+        try:
+            tmpdir = await asyncio.to_thread(tempfile.mkdtemp, prefix="agentmail-")
+            saved, errors = await asyncio.to_thread(
+                download_attachments, self._mailer_or_raise(), m, tmpdir
+            )
+            if errors:
+                logger.warning(f"[agentmail] 附件下载部分失败：{'；'.join(errors)}")
+            if saved:
+                logger.info(f"[agentmail] 附件已下载 {len(saved)} 个到临时目录")
+            return saved, errors, tmpdir
+        except Exception as e:  # noqa: BLE001 附件永远不能把整轮推送搞挂
+            logger.warning(f"[agentmail] 附件准备失败，降级为文字清单：{e}")
+            self._cleanup_dir(tmpdir)
+            return [], [f"下载失败（{e}）"], None
+
+    @staticmethod
+    def _file_component(item: dict):
+        """AstrBot 文件消息组件：`astrbot.api.message_components.File(name=..., file=...)`。
+
+        File 的构造签名（astrbot/core/message/components.py）：
+            File(name: str, file: str = "", url: str = "")
+        """
+        return Comp.File(name=item.get("filename") or "attachment", file=item.get("path") or "")
+
+    @staticmethod
+    def _cleanup_dir(tmpdir) -> None:
+        """临时文件用完就删，别把容器磁盘塞满。"""
+        if not tmpdir:
+            return
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     @staticmethod
     def _is_incoming(m: dict) -> bool:
@@ -287,11 +374,13 @@ class AgentMailPlugin(Star):
         if isinstance(to, (list, tuple)):
             to = ", ".join(str(x) for x in to)
         body = m.get("text") or m.get("preview") or m.get("extracted_text") or "(无正文)"
-        return (
+        text = (
             f"主题：{m.get('subject', '(无主题)')}\n"
             f"发件人：{frm}\n收件人：{to or '?'}\n时间：{m.get('timestamp', '?')}\n"
             f"────────────\n{str(body)[:1500]}"
         )
+        block = attachment_block(m.get("attachments"))  # v0.4.0：读信也带上附件清单
+        return f"{text}\n{block}" if block else text
 
     # ── LLM 工具 ────────────────────────────────────────────
     @filter.llm_tool(name="agentmail_send")

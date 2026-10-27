@@ -1,15 +1,19 @@
-"""不装 AstrBot 也能测：用假的 astrbot.api 模块桩，把插件真正跑一遍（v0.3.0）。
+"""不装 AstrBot 也能测：用假的 astrbot.api 模块桩，把插件真正跑一遍（v0.4.0）。
 
 覆盖：帮助 / 缺参 / 白名单拦截 / 真发信 / 查收件箱 / 会话ID / 收信轮询（基线+推送）
       + v0.3.0 推送模板：默认模板与 v0.2.0 逐字一致 / 自定义模板渲染 / 非法模板回退不抛异常
+      + v0.4.0 附件随推送：清单格式 / 有附件发真文件 / 无附件行为不变 /
+        下载失败降级 / 适配器不支持文件降级 / 临时目录清理
 
 用法：
     PYTHONDONTWRITEBYTECODE=1 python3 selftest.py            # 含真实 API 抽查（没网/没 key 会自动跳过）
     PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline  # 只跑本地断言
 """
 import asyncio
+import glob
 import os
 import sys
+import tempfile
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -67,8 +71,21 @@ class _MessageChain:
 astrbot = types.ModuleType("astrbot")
 api = types.ModuleType("astrbot.api")
 api.logger = _log
+class _File:
+    """对应 astrbot.api.message_components.File(name, file, url)。"""
+
+    def __init__(self, name="", file="", url=""):
+        self.name = name
+        self.file_ = file
+        self.url = url
+
+    def __repr__(self):
+        return f"File(name={self.name!r}, file={self.file_!r})"
+
+
 comp_mod = types.ModuleType("astrbot.api.message_components")
 comp_mod.Plain = _Plain
+comp_mod.File = _File
 event_mod = types.ModuleType("astrbot.api.event")
 event_mod.AstrMessageEvent = type("AstrMessageEvent", (), {})
 event_mod.MessageChain = _MessageChain
@@ -85,9 +102,25 @@ sys.modules.update({
 })
 
 try:
+    from astrbot_plugin_agentmail.attach import (  # noqa: E402
+        attachment_block,
+        attachment_lines,
+        download_attachments,
+        human_size,
+        safe_filename,
+    )
+    from astrbot_plugin_agentmail.mailer import MailError  # noqa: E402
     from astrbot_plugin_agentmail.main import AgentMailPlugin  # noqa: E402
     from astrbot_plugin_agentmail.notify import render_notice  # noqa: E402
 except ImportError:  # 仓库根目录直接跑
+    from attach import (  # noqa: E402
+        attachment_block,
+        attachment_lines,
+        download_attachments,
+        human_size,
+        safe_filename,
+    )
+    from mailer import MailError  # noqa: E402
     from main import AgentMailPlugin  # noqa: E402
     from notify import render_notice  # noqa: E402
 
@@ -126,8 +159,64 @@ class FakeMailer:
     def __init__(self, messages):
         self.messages = messages
 
-    def list(self, limit=5):
+    def list(self, limit=5, labels=None):
         return self.messages[:limit]
+
+
+class FakeAttachMailer(FakeMailer):
+    """带附件接口的假 mailer：可模拟下载成功 / 失败。"""
+
+    BLOB = b"hello attachment"
+
+    def __init__(self, messages, fail_download=False, missing_url=False):
+        super().__init__(messages)
+        self.fail_download = fail_download
+        self.missing_url = missing_url
+        self.calls = []
+
+    def attachment_info(self, message_id, attachment_id):
+        self.calls.append(("info", message_id, attachment_id))
+        info = {
+            "attachment_id": attachment_id,
+            "filename": "report.txt",
+            "size": len(self.BLOB),
+            "content_type": "text/plain",
+            "content_disposition": "attachment",
+        }
+        if not self.missing_url:
+            info["download_url"] = "https://cdn.agentmail.to/attachments/x?Signature=abc"
+        return info
+
+    def download(self, url, dest_path, limit=None):
+        self.calls.append(("download", url))
+        if self.fail_download:
+            raise MailError("直连下载失败（HTTP 403）")
+        with open(dest_path, "wb") as f:
+            f.write(self.BLOB)
+        return len(self.BLOB)
+
+
+class RecordingContext(FakeContext):
+    """记录推送，并在发送那一刻探一下附件文件到底存不存在。"""
+
+    def __init__(self):
+        super().__init__()
+        self.exists_at_send = []
+
+    async def send_message(self, session, chain):
+        for c in getattr(chain, "components", []):
+            if isinstance(c, _File):
+                self.exists_at_send.append(os.path.exists(c.file_))
+        return await super().send_message(session, chain)
+
+
+class PickyContext(RecordingContext):
+    """模拟适配器不支持文件消息：带 File 的链会抛异常。"""
+
+    async def send_message(self, session, chain):
+        if any(isinstance(c, _File) for c in getattr(chain, "components", [])):
+            raise RuntimeError("当前平台适配器不支持文件消息")
+        return await super().send_message(session, chain)
 
 
 def read_key():
@@ -165,14 +254,34 @@ async def run(handler, evt, label):
         print("←", r)
 
 
-def mail(mid, subject, labels=("received", "unread"), frm="someone@qq.com", preview=None):
-    return {
+def mail(
+    mid,
+    subject,
+    labels=("received", "unread"),
+    frm="someone@qq.com",
+    preview=None,
+    attachments=None,
+):
+    m = {
         "message_id": mid,
         "subject": subject,
         "from": frm,
         "timestamp": "2026-10-27T10:00:00.000Z",
         "labels": list(labels),
         "preview": "这是一封测试邮件的正文预览，用来验证推送文案。" if preview is None else preview,
+    }
+    if attachments is not None:
+        m["attachments"] = attachments
+    return m
+
+
+def att(filename="report.txt", size=29, content_type="text/plain", attachment_id="att-1"):
+    return {
+        "attachment_id": attachment_id,
+        "filename": filename,
+        "size": size,
+        "content_type": content_type,
+        "content_disposition": "attachment",
     }
 
 
@@ -279,6 +388,141 @@ def test_notify_template():
     print("④ _compose_notice 走配置：自定义模板 / 空配置 / 非法模板（回退+warning）三种都对 ✅")
 
 
+def test_attachment_helpers():
+    """v0.4.0 功能①：附件纯函数（不碰网络）。"""
+    print("\n── 附件（v0.4.0 纯函数）──")
+
+    # 大小格式化
+    assert human_size(29) == "29 B"
+    assert human_size(1536) == "1.5 KB"
+    assert human_size(3 * 1024 * 1024) == "3.0 MB"
+    assert human_size(None) == "?" and human_size("abc") == "?"
+
+    # 文件名清洗（防目录穿越 / 特殊字符）
+    assert safe_filename("../../etc/passwd") == "passwd"
+    assert safe_filename('a:b*c?"d.txt') == "a_b_c__d.txt"
+    assert safe_filename("") == "attachment.bin"
+
+    # 清单：附件名 + 大小 + 类型
+    lines = attachment_lines([att()])
+    assert lines == ["· report.txt（29 B · text/plain）"], lines
+    assert attachment_lines([]) == [] and attachment_lines(None) == [] and attachment_lines("x") == []
+    block = attachment_block([att(), att("图.png", 2048, "image/png", "att-2")])
+    assert "📎 附件 2 个" in block, block
+    assert "· 图.png（2.0 KB · image/png）" in block, block
+
+    # 无附件：文案必须与 v0.2.0 逐字一致（一个字符都不能多）
+    plain = mail("x", "无附件")
+    assert render_notice(plain) == legacy_v020_notice(plain)
+    assert render_notice(plain, template="{subject}|{from}") == "无附件|someone@qq.com"
+    print("   ① 清单格式 / 大小 / 文件名清洗 ✅；无附件时文案与 v0.3.0 逐字一致 ✅")
+
+    # 有附件：正文照旧 + 末尾追加清单（模板模式也一样）
+    with_att = mail("y", "有附件", attachments=[att()])
+    got = render_notice(with_att)
+    assert got.startswith(legacy_v020_notice(with_att)), got
+    assert "📎 附件 1 个" in got and "report.txt（29 B · text/plain）" in got, got
+    got_tpl = render_notice(with_att, template="{subject}")
+    assert got_tpl.startswith("有附件") and "📎 附件 1 个" in got_tpl, got_tpl
+    print("   ② 有附件时正文不变、末尾追加「附件名 + 大小 + 类型」清单 ✅（模板模式同样追加）")
+
+    # download_attachments：成功 / 缺 download_url / 下载失败 三种都不抛
+    tmp = tempfile.mkdtemp(prefix="agentmail-test-")
+    try:
+        ok_mailer = FakeAttachMailer([])
+        saved, errors = download_attachments(ok_mailer, with_att, tmp)
+        assert len(saved) == 1 and not errors, (saved, errors)
+        assert saved[0]["filename"] == "report.txt" and saved[0]["size"] == len(FakeAttachMailer.BLOB)
+        assert os.path.exists(saved[0]["path"]), "附件应该真的落盘"
+        assert ok_mailer.calls[0][0] == "info" and ok_mailer.calls[1][0] == "download"
+
+        saved2, errors2 = download_attachments(FakeAttachMailer([], fail_download=True), with_att, tmp)
+        assert saved2 == [] and errors2 and "report.txt" in errors2[0], (saved2, errors2)
+
+        saved3, errors3 = download_attachments(FakeAttachMailer([], missing_url=True), with_att, tmp)
+        assert saved3 == [] and any("download_url" in e for e in errors3), errors3
+
+        assert download_attachments(ok_mailer, plain, tmp) == ([], []), "没有附件时不该动网络"
+    finally:
+        import shutil as _sh
+
+        _sh.rmtree(tmp, ignore_errors=True)
+    print("   ③ 下载成功落盘 / 缺 download_url / 下载失败 → 都只报 errors 不抛异常 ✅")
+
+
+async def test_attachment_push():
+    """v0.4.0 功能①：附件随推送（走 _poll_once，离线假 mailer）。"""
+    print("\n── 附件随推送（v0.4.0 集成）──")
+    base_dirs = set(glob.glob(os.path.join(tempfile.gettempdir(), "agentmail-*")))
+
+    # ④ 有附件 + notify_attachments=true：清单 + 真文件一起发
+    ctx = RecordingContext()
+    p = AgentMailPlugin(ctx, conf(notify_on_first_poll=True, notify_attachments=True))
+    p._mailer = FakeAttachMailer([mail("m1", "报表来了", attachments=[att()])])
+    st = await p._poll_once()
+    assert st["new"] == 1 and st["pushed"] == 1 and st["files"] == 1, st
+    comps = ctx.sent[-1][1].components
+    assert len(comps) == 2, comps
+    assert isinstance(comps[0], _Plain) and isinstance(comps[1], _File), comps
+    assert comps[1].name == "report.txt", comps[1]
+    assert ctx.exists_at_send == [True], "发消息那一刻附件文件必须真的在临时目录里"
+    assert "📎 附件 1 个" in comps[0].text and "report.txt（29 B · text/plain）" in comps[0].text
+    # 临时目录用完即删
+    assert not os.path.exists(os.path.dirname(comps[1].file_)), "临时附件目录没有清理"
+    print("   ④ 有附件 + notify_attachments=true → Plain + File(report.txt) 一起发出，"
+          "清单在正文里，临时目录已清理 ✅")
+
+    # ⑤ 无附件：行为与 v0.3.0 完全一致
+    ctx2 = RecordingContext()
+    p2 = AgentMailPlugin(ctx2, conf(notify_on_first_poll=True, notify_attachments=True))
+    p2._mailer = FakeAttachMailer([mail("m2", "没附件")])
+    st2 = await p2._poll_once()
+    assert st2["pushed"] == 1 and st2["files"] == 0, st2
+    assert len(ctx2.sent[-1][1].components) == 1, ctx2.sent[-1][1].components
+    assert ctx2.sent[-1][1].components[0].text == legacy_v020_notice(mail("m2", "没附件"))
+    assert p2._mailer.calls == [], "没附件不该去请求附件接口"
+    print("   ⑤ 无附件 → 单条 Plain 推送，文案与 v0.3.0 逐字一致，不请求附件接口 ✅")
+
+    # ⑥ notify_attachments 默认关闭：清单照显示，但不下载真文件
+    ctx3 = RecordingContext()
+    p3 = AgentMailPlugin(ctx3, conf(notify_on_first_poll=True))  # 不传 notify_attachments
+    assert p3.conf.get("notify_attachments") in (None, False)
+    p3._mailer = FakeAttachMailer([mail("m3", "有附件但没开", attachments=[att()])])
+    st3 = await p3._poll_once()
+    assert st3["files"] == 0 and st3["pushed"] == 1, st3
+    comps3 = ctx3.sent[-1][1].components
+    assert len(comps3) == 1 and "📎 附件 1 个" in comps3[0].text, comps3
+    assert p3._mailer.calls == [], "关闭 notify_attachments 时不该下载附件"
+    print("   ⑥ notify_attachments 默认关闭 → 只发文字清单、零下载（省流量、行为不变）✅")
+
+    # ⑦ 下载失败 → 降级文字清单 + warning，整轮推送不挂
+    WARNINGS.clear()
+    ctx4 = RecordingContext()
+    p4 = AgentMailPlugin(ctx4, conf(notify_on_first_poll=True, notify_attachments=True))
+    p4._mailer = FakeAttachMailer([mail("m4", "下载会失败", attachments=[att()])], fail_download=True)
+    st4 = await p4._poll_once()
+    assert st4["pushed"] == 1 and st4["files"] == 0, st4
+    text4 = ctx4.sent[-1][1].components[0].text
+    assert "📎 附件 1 个" in text4 and "附件没发出去" in text4, text4
+    assert len(ctx4.sent[-1][1].components) == 1, ctx4.sent[-1][1].components
+    assert any("附件下载" in w for w in WARNINGS), WARNINGS
+    print("   ⑦ 下载失败 → 降级成文字清单 + warning，推送照常完成 ✅")
+
+    # ⑧ 文件消息本身发不出去 → 再降级成纯文字，不重试轰炸
+    ctx5 = PickyContext()
+    p5 = AgentMailPlugin(ctx5, conf(notify_on_first_poll=True, notify_attachments=True))
+    p5._mailer = FakeAttachMailer([mail("m5", "平台不支持文件", attachments=[att()])])
+    st5 = await p5._poll_once()
+    assert st5["pushed"] == 1 and st5["degraded"] == 1 and st5["files"] == 0, st5
+    assert "已降级为文字清单" in ctx5.sent[-1][1].components[0].text
+    print("   ⑧ 适配器不支持文件消息 → 自动降级纯文字（degraded=1），不抛不重试 ✅")
+
+    # ⑨ 兜底：整轮没有残留临时目录
+    leftovers = set(glob.glob(os.path.join(tempfile.gettempdir(), "agentmail-*"))) - base_dirs
+    assert not leftovers, f"临时目录没清干净：{leftovers}"
+    print("   ⑨ 四轮推送过后 /tmp 无残留 agentmail-* 临时目录 ✅")
+
+
 async def main():
     key = read_key()
     ctx = FakeContext()
@@ -330,6 +574,10 @@ async def main():
 
     # ── v0.3.0 推送模板 ──
     test_notify_template()
+
+    # ── v0.4.0 附件随推送 ──
+    test_attachment_helpers()
+    await test_attachment_push()
 
     print("\n全部断言通过 ✅")
 

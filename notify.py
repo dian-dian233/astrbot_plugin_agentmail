@@ -13,12 +13,19 @@ v0.3.0 新增配置 `notify_template`：
 2. 模板非法（未知占位符 `{foo}`、花括号没闭合 `{subject`、格式控制等）
    → **不抛异常**，回退内置文案，并通过 warn 回调（默认标准库 logging）
    记一条 warning。
+3. v0.4.0 新增附件清单：邮件有附件时，在文案末尾追加「📎 附件 N 个 + 清单」；
+   没有附件时输出与 v0.2.0/v0.3.0 逐字一致。
 """
 
 from __future__ import annotations
 
 import logging
 import string
+
+try:  # 插件包内导入
+    from .attach import attachment_block
+except ImportError:  # 单独运行 / 被平铺加载时
+    from attach import attachment_block  # type: ignore[no-redef]
 
 DEFAULT_PREVIEW_LEN = 300
 PLACEHOLDERS = ("subject", "from", "preview", "time", "inbox")
@@ -111,21 +118,38 @@ def render_notice(
     preview_len=DEFAULT_PREVIEW_LEN,
     inbox: str = "",
     warn=None,
+    attachments=None,
 ) -> str:
-    """渲染推送文案。模板空/非法都回退内置文案，且永远不抛异常。"""
+    """渲染推送文案。模板空/非法都回退内置文案，且永远不抛异常。
+
+    v0.4.0：`attachments` 传 None 时自动读 `message["attachments"]`；
+    有附件就在文案末尾追加清单，没有附件则输出和 v0.2.0/v0.3.0 逐字一致。
+    """
     fallback = builtin_notice(message, preview_len)
     emit = warn or logger.warning
+    atts = message.get("attachments") if isinstance(message, dict) else None
+    if attachments is not None:
+        atts = attachments
 
     if template is None:
-        return fallback
+        return _with_attachments(fallback, atts)
     if not isinstance(template, str):
         emit(f"[agentmail] notify_template 类型不对（{type(template).__name__}），已回退内置文案")
-        return fallback
+        return _with_attachments(fallback, atts)
     if not template.strip():
-        return fallback
+        return _with_attachments(fallback, atts)
 
     try:
-        return render_template(template, template_values(message, preview_len, inbox))
+        text = render_template(template, template_values(message, preview_len, inbox))
     except TemplateError as e:
         emit(f"[agentmail] 推送模板不可用，已回退内置文案：{e}")
-        return fallback
+        text = fallback
+    return _with_attachments(text, atts)
+
+
+def _with_attachments(text: str, attachments) -> str:
+    block = attachment_block(attachments)
+    if not block:
+        return text
+    return f"{text}\n{block}"
+
