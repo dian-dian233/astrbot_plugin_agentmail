@@ -43,6 +43,10 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 | `notify_preview_len` | 推送里的正文预览字数，默认 300 |
 | `notify_template` | 推送文案模板，**留空=内置文案**。可用占位符 `{subject}` `{from}` `{preview}` `{time}` `{inbox}`；写错（未知占位符、花括号没闭合）会自动回退内置文案并记 warning，不会报错 |
 | `notify_on_first_poll` | 首次轮询是否推送历史邮件，建议保持关（首次只记基线，不刷屏） |
+| `notify_attachments` | 新邮件带附件时是否把**附件文件一起发出去**，默认关。关＝只在推送里追加附件清单（文件名 + 大小 + 类型）；开＝清单之后再用文件组件逐个发文件，失败自动降级成清单 |
+| `digest_enabled` | 是否开启**每日未读摘要**，默认关 |
+| `digest_time` | 每日摘要推送时间，24 小时制，默认 `09:00`。写错（`25:00`/`9点`/空）自动回退 `09:00` 并记 warning |
+| `digest_sessions` | 每日摘要推送到哪些会话，**留空则回退 `notify_sessions`** |
 
 > ⚠️ 建议保持 `allow_all=false`：邮箱是你的，别人能用了就能以你的名义发信。群聊要用就填 `allowed_groups`。
 
@@ -152,6 +156,44 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 
 模板写坏了（比如 `{foo}`、`{subject` 没闭合、`{subject!r}`）**不会报错**：自动回退内置文案，日志里留一条 warning，`[agentmail] 推送模板不可用，已回退内置文案：…`。
 
+### 附件随推送一并送达（v0.5.0）
+
+新邮件带附件时，不再只有一句「正文预览」，而是把附件也一起交代清楚。开关是
+`notify_attachments`（默认 **关**）：
+
+| 值 | 行为 |
+| --- | --- |
+| `false`（默认） | 推送文案末尾追加**附件清单**：文件名 + 可读大小 + 类型，例如 `· report.pdf（12.3KB · application/pdf）`。不下载、不发文件，只让你知道有附件 |
+| `true` | 清单照旧，然后**在同一个消息链里**把附件逐个发出去 |
+
+推送长这样（`notify_attachments=false`，有 2 个附件时）：
+
+```
+📬 新邮件
+主题：带附件的邮件
+发件人：someone@qq.com
+时间：2026-10-27T10:00:00
+────────────
+正文预览…
+────────────
+📎 附件 2 个
+· report.pdf（12.3KB · application/pdf）
+· 数据.csv（3.1MB · text/csv）
+```
+
+实现上的几个要点：
+
+- 发文件用的是 **`Comp.File(name=<文件名>, url=<download_url>)`**：`File.file` 这个
+  property 会自己拿 `url` 去下载，**不用落临时文件**；整条消息链是「一段文字 + N 个文件组件」
+- `download_url` 来自 `GET /v0/inboxes/{inbox}/messages/{message_id}/attachments/{attachment_id}`，
+  是**带签名、会过期**的临时地址，每次发送前现取，不做任何缓存
+- **失败只降级、不炸**：取不到下载地址 → 该附件留在文字清单里 + 一条 warning，正文照发；
+  平台不支持文件组件（发送抛异常）→ 自动降级成纯文字清单重试一次 + 一条 warning
+- 一封邮件最多发 5 个附件、清单最多列 8 条（再多折叠成「…还有 N 个」），
+  整条推送长度上限 1500 字，不会把消息塞爆
+- `attachments` 字段缺失 / 是 `None` / 是字符串 / 是空 list / 元素不是对象 → 安全跳过，
+  文案和没有附件时逐字一致
+
 例子：
 
 ```
@@ -162,6 +204,39 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 ```
 
 多个收件人用英文逗号：`a@x.com,b@y.com`。
+
+## 每日未读摘要（v0.5.0）
+
+不想被一封封推送打断，也可以只要**每天一条**的汇总：`digest_enabled` 打开，
+`digest_time` 填时间（24 小时制，默认 `09:00`），`digest_sessions` 填推送目标
+（**留空就用 `notify_sessions`**，一般不用填）。
+
+到点推送长这样：
+
+```
+📬 每日未读摘要 · 2026-10-27
+收件箱：diandian233@agentmail.to
+未读邮件：3 封
+────────────
+最新 3 封：
+1. 10-27 12:00 · boss@corp.com · 最新的一封
+2. 10-27 11:00 · someone@qq.com · 第二封
+3. 10-27 10:00 · other@x.com · 第三封
+```
+
+几个实现约定（都是踩过的坑）：
+
+- **插件自带定时**：`asyncio` 循环 + 下次触发时间计算，加载时在 `initialize()` 里起、
+  `terminate()` 里取消，**不依赖外部 cron**
+- **用本地时间**判断到点，不用 UTC（东八区用 UTC 会差 8 小时，跨天时容易「一天推两次」或「整天不推」）
+- **同一天只推一次**：最后一次推送的本地日期存在插件 KV（`digest_last_date`），
+  **进程重启也不会重复推当天**；跨天（日期变了）照常推
+- 进程中途启动、且当天已经过了点到时间 → 补推一次，不漏天
+- `digest_time` 写错（`25:00`、`9点`、空、`9:70`、`abc`）→ 回退 `09:00` + 一条 warning，**不抛异常**
+- **和收信轮询共用同一个 Mailer 实例**，不会开两条连接猛刷 API
+- 摘要推送失败（会话不可达）只记 warning，不标记当天已推，下次还能补上
+- 未读口径：`labels` 含 `unread`、且不含 `sent`；没带 `labels` 的邮件按未读算（宁多不漏）；
+  拉到 50 封上限时文案显示 `50+ 封`，不报假精确数字
 
 ## 自然语言
 
@@ -190,6 +265,8 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 | `被网关拦截（返回 HTML 页面）` | 没连上 AgentMail，是本地网关吐的页面 → 配置里填 `proxy` |
 | `没有配置 AgentMail API Key` | 配置项 `api_key` 是空的，填完记得保存并重载插件 |
 | 群里发指令没反应 | 先看 `allow_all` / `allowed_groups` / 是否管理员；再确认这个会话没禁用 `/mail` 指令 |
+| 只看到附件清单、没收到附件文件 | `notify_attachments` 没开；或平台不支持文件组件（日志里有「降级为纯文字清单重试」warning，清单里的信息照样是全的） |
+| 到点没收到每日摘要 | 看 `digest_enabled` 是否打开、`digest_sessions`（或 `notify_sessions`）是否填了会话 ID、`digest_time` 格式对不对；日志关键字「每日未读摘要」 |
 
 日志关键字：`[agentmail]`
 
@@ -198,6 +275,13 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 ```
 /mail send ...  →  Mailer.send()  →  POST /v0/inboxes/{inbox}/messages/send
                                      Authorization: Bearer <api_key>
+
+收信推送 + 附件 → Mailer.list()           →  GET  /v0/inboxes/{inbox}/messages
+                → Mailer.attachment_info() →  GET  /v0/inboxes/{inbox}/messages/{id}/attachments/{aid}
+                                             →  download_url（带签名、会过期，现取现用）
+
+每日未读摘要    → asyncio 定时（本地时间，同一天只推一次，日期存 KV）
+                → Mailer.list(50) → 未读计数 + 最新 3 封 → MessageChain([Plain]) → send_message
 ```
 
 接口文档：<https://docs.agentmail.to>（OpenAPI：<https://docs.agentmail.to/openapi.json>，注意路径是 `/v0`）

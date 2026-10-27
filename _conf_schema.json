@@ -76,5 +76,29 @@
     "type": "bool",
     "hint": "保持关闭：首次只把现有邮件记为基线，不会刷屏",
     "default": false
+  },
+  "notify_attachments": {
+    "description": "新邮件带附件时，把附件文件一起发出去",
+    "type": "bool",
+    "hint": "关闭（默认）：只在推送文案里追加附件清单（文件名 + 大小 + 类型）。打开：清单之后再用文件组件把附件逐个发出去；取不到下载地址或平台不支持文件组件时自动降级成文字清单，只记 warning",
+    "default": false
+  },
+  "digest_enabled": {
+    "description": "开启每日未读摘要",
+    "type": "bool",
+    "hint": "插件自带定时（不依赖外部 cron）：每天到点统计未读邮件数量 + 最新 3 封（时间 · 发件人 · 主题）推到 digest_sessions；用本地时间判断，同一天只推一次，重启也不会重复推当天",
+    "default": false
+  },
+  "digest_time": {
+    "description": "每日摘要推送时间（24 小时制）",
+    "type": "string",
+    "hint": "例如 09:00、21:30。格式写错（25:00 / 9点 / 空）会自动回退 09:00 并记一条 warning，不会报错",
+    "default": "09:00"
+  },
+  "digest_sessions": {
+    "description": "每日摘要推送到哪些会话",
+    "type": "list",
+    "hint": "留空则回退用 notify_sessions。填法和 notify_sessions 一样（/mail here 拿到的会话 ID，一行一个）",
+    "default": []
   }
 }
