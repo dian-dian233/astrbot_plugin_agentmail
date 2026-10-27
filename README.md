@@ -25,6 +25,16 @@ git clone https://github.com/dian-dian233/astrbot_plugin_agentmail.git
 # 然后 WebUI 里重载插件 / 重启 astrbot 容器
 ```
 
+**方式三：zip 压缩包（GitHub Release 下载）**
+
+去 [Releases](https://github.com/dian-dian233/astrbot_plugin_agentmail/releases/latest) 下 `astrbot_plugin_agentmail-<version>.zip`，**zip 顶层就是 `astrbot_plugin_agentmail/` 文件夹**：
+
+```bash
+cd /path/to/AstrBot/data/plugins
+unzip ~/Downloads/astrbot_plugin_agentmail-0.5.1.zip   # 直接解出 astrbot_plugin_agentmail/ 文件夹
+# 然后 WebUI 里重载插件 / 重启 astrbot 容器
+```
+
 无第三方依赖，`requirements.txt` 是空的，不用 pip 装东西。
 
 ## 配置
@@ -273,7 +283,7 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 
 日志关键字：`[agentmail]`
 
-## CI/CD
+## CI/CD 与发版
 
 `.github/workflows/` 里两个工作流，跑在 GitHub Actions 上。**不用任何 secrets**，只吃默认的 `GITHUB_TOKEN`，权限在 yml 里显式声明为最小（CI 只 `contents: read`，发版只有建 Release 的那个 job 拿 `contents: write`）。
 
@@ -309,7 +319,7 @@ git tag v0.5.1
 git push origin v0.5.1
 ```
 
-然后工作流会：校验 tag ↔ version → 打包 `astrbot_plugin_agentmail-<version>.zip`（插件文件直接躺在 zip 顶层，符合 WebUI 手动安装习惯；排除 `__pycache__` / `.git` / `selftest.py` / CI 自身）→ 用 `gh release create` 建 Release、挂上 zip，release notes 自动取 `git log`（上一个 tag 到这次的提交）。
+然后工作流会：校验 tag ↔ version → 打包 `astrbot_plugin_agentmail-<version>.zip`（zip **顶层就是 `astrbot_plugin_agentmail/` 文件夹**，里面的 `metadata.yaml` / `main.py` / `_conf_schema.json` 一应俱全；已排除 `__pycache__` / `.git` / `selftest.py` / CI 自身）→ 用 `gh release create` 建 Release、挂上 zip，release notes 自动取 `git log`（上一个 tag 到这次的提交）。
 
 不想为了验证就污染仓库？用 **workflow_dispatch**：Actions → Release → Run workflow，只做「校验 tag ↔ version + 打包 + 上传 artifact」，默认**不**建 Release（想真发才勾 `publish`）。也可以故意填错 tag（如 `v9.9.9`）看它红。
 
