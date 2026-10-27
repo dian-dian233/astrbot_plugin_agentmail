@@ -26,7 +26,7 @@
   "allow_all": {
     "description": "允许所有会话使用",
     "type": "bool",
-    "hint": "关掉后仅管理员和三张白名单可用（推荐关掉，避免别人拿你的邮箱乱发）",
+    "hint": "关掉后仅管理员和两张白名单可用（推荐关掉，避免别人拿你的邮箱乱发）",
     "default": false
   },
   "allowed_users": {
@@ -40,5 +40,35 @@
     "type": "list",
     "hint": "整群可用就填群号，一行一个",
     "default": []
+  },
+  "poll_enabled": {
+    "description": "开启收信轮询（新邮件推到指定会话）",
+    "type": "bool",
+    "hint": "打开后需要同时填 notify_sessions，否则不会启动",
+    "default": false
+  },
+  "poll_interval": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "hint": "最小 60，默认 300（5 分钟），别设太密，AgentMail 有速率限制",
+    "default": 300
+  },
+  "notify_sessions": {
+    "description": "新邮件推送到哪些会话",
+    "type": "list",
+    "hint": "在目标会话里发 /mail here 拿到 ID，一行一个，例如 aiocqhttp:FriendMessage:1150880493",
+    "default": []
+  },
+  "notify_preview_len": {
+    "description": "推送里的正文预览字数",
+    "type": "int",
+    "hint": "默认 300",
+    "default": 300
+  },
+  "notify_on_first_poll": {
+    "description": "首次轮询是否也推送历史邮件",
+    "type": "bool",
+    "hint": "保持关闭：首次只把现有邮件记为基线，不会刷屏",
+    "default": false
   }
 }

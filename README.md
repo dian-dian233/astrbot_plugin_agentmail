@@ -37,6 +37,11 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 | `allow_all` | 是否允许所有会话使用。**默认关**，只放管理员和白名单 |
 | `allowed_users` | 允许使用的用户 ID（QQ 号等），一行一个 |
 | `allowed_groups` | 允许整群使用的群号，一行一个 |
+| `poll_enabled` | 是否开启收信轮询（新邮件推到会话），默认关 |
+| `poll_interval` | 轮询间隔秒数，最小 60，默认 300 |
+| `notify_sessions` | 新邮件推送到哪些会话，用 `/mail here` 拿到的 ID，一行一个 |
+| `notify_preview_len` | 推送里的正文预览字数，默认 300 |
+| `notify_on_first_poll` | 首次轮询是否推送历史邮件，建议保持关（首次只记基线，不刷屏） |
 
 > ⚠️ 建议保持 `allow_all=false`：邮箱是你的，别人能用了就能以你的名义发信。群聊要用就填 `allowed_groups`。
 
@@ -47,6 +52,37 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 /mail list [数量]
 /mail read <message_id>
 /mail whoami
+/mail here            # 打印当前会话 ID，填收信推送用
+/mail poll            # 手动跑一次收信轮询
+```
+
+## 收信推送（v0.2.0）
+
+有人往 `diandian233@agentmail.to` 发信，插件可以主动推到你的私聊或群里。
+
+开法三步：
+
+1. 在**目标会话**里发 `/mail here`，拿到类似 `aiocqhttp:FriendMessage:1150880493` 的 ID
+2. 插件配置：`poll_enabled` 打开，`notify_sessions` 填上这个 ID（多个一行一个）
+3. 重载插件，日志出现 `收信轮询已启动` 就成
+
+细节：
+
+- **首次只记基线**：第一次轮询会把现有邮件标记为已读基线，不会把历史邮件全推一遍（想推就把 `notify_on_first_poll` 打开）
+- **去重**：已推送过的 `message_id` 存在插件 KV 里（最近 200 条），重启不会重复推
+- **只推收到的**：自己发出去的（`labels` 含 `sent`）会被跳过
+- **失败不致死**：某个会话推失败只记 warning，不影响其它会话和下一轮
+- 想立刻验证效果，不用等 5 分钟，发 `/mail poll` 手动跑一次
+
+推送文案长这样：
+
+```
+📬 新邮件
+主题：新来的
+发件人：someone@qq.com
+时间：2026-10-27T10:00:00
+────────────
+正文预览前 300 字…
 ```
 
 例子：
