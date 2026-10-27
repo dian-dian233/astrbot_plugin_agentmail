@@ -3,14 +3,39 @@
 设计要点：
 1. 出网双通道：默认直连；如果拿回来的是网关的 HTML 错误页（403/502 之类），
    自动回退到代理再试一次。这样「被墙的内网」和「放通的远程机」都不用改代码。
-2. 只做加法：send / list / read / whoami，够用就好，方便别人读代码。
+2. 只做加法：send / list / read / whoami / search，够用就好，方便别人读代码。
+3. v0.4.0 加了 `search()`：优先走 AgentMail 服务端搜索端点
+   `GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<n>`（参数名取自官方
+   OpenAPI：只有 `q` / `limit` / `page_token` / `before` / `after`，没有 body）。
+   该端点报 400/404/405/422/501（例如套餐或权限不支持）时，自动退化为
+   `list(50)` 拉下来用 search.py 里的纯函数本地过滤，并在日志里记一条 warning。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
+import urllib.parse
 import urllib.request
+
+try:  # 插件包内导入
+    from .search import (
+        DEFAULT_LIMIT,
+        filter_messages,
+        normalize_limit,
+    )
+except ImportError:  # 单独运行 / 被平铺加载时
+    from search import (  # type: ignore[no-redef]
+        DEFAULT_LIMIT,
+        filter_messages,
+        normalize_limit,
+    )
+
+logger = logging.getLogger("astrbot_plugin_agentmail")
+# 服务端搜索端点"不可用"的状态码：这些情况退化成本地过滤，其它错误（401 等）照常抛
+SEARCH_FALLBACK_STATUS = (400, 404, 405, 422, 501)
+SEARCH_FALLBACK_SCAN = 50
 
 DEFAULT_BASE = "https://api.agentmail.to/v0"
 DEFAULT_INBOX = "diandian233@agentmail.to"
@@ -116,6 +141,34 @@ class Mailer:
     def list(self, limit: int = 5) -> list[dict]:
         data = self.request(f"/inboxes/{self.inbox}/messages?limit={max(1, min(50, int(limit)))}")
         return data.get("messages") or data.get("data") or []
+
+    def search(self, keyword: str, limit: int = DEFAULT_LIMIT) -> list[dict]:
+        """关键词搜历史邮件：先服务端全文搜索，端点不可用时退化为本地过滤。
+
+        - 关键词为空 → 直接 `[]`（不打 API）
+        - `limit` 非法/超范围由 search.normalize_limit 夹成 [1, 20]，默认 5
+        - 服务端按相关度排序返回；本地兜底则按收件箱原顺序（最新在前）
+        """
+        kw = (keyword or "").strip()
+        n = normalize_limit(limit)
+        if not kw:
+            return []
+        path = f"/inboxes/{self.inbox}/messages/search?q={urllib.parse.quote(kw)}&limit={n}"
+        try:
+            data = self.request(path)
+        except MailError as e:
+            if e.status not in SEARCH_FALLBACK_STATUS:
+                raise
+            logger.warning(
+                f"[agentmail] 服务端搜索不可用（HTTP {e.status}），退化为 list({SEARCH_FALLBACK_SCAN}) 本地过滤"
+            )
+            return self._search_locally(kw, n)
+        messages = data.get("messages") or data.get("data") or []
+        return [m for m in messages if isinstance(m, dict)][:n]
+
+    def _search_locally(self, keyword: str, limit: int = DEFAULT_LIMIT) -> list[dict]:
+        """兜底：拉最近 50 封，本地做大小写不敏感的子串过滤（主题/发件人/正文预览）。"""
+        return filter_messages(self.list(SEARCH_FALLBACK_SCAN), keyword, limit)
 
     def read(self, message_id: str) -> dict:
         return self.request(f"/inboxes/{self.inbox}/messages/{message_id}")

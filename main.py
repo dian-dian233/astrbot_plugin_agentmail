@@ -11,6 +11,9 @@
 v0.2.0 新增：后台收信轮询，把新邮件推到 notify_sessions 里配置的会话/群。
 v0.3.0 新增：推送文案可配（notify_template，占位符 {subject} {from} {preview} {time} {inbox}），
             渲染逻辑抽到 notify.py（纯标准库、可单测），模板非法时回退内置文案。
+v0.4.0 新增：/mail search <关键词> [数量]，搜历史邮件（主题 / 发件人 / 正文预览），
+            解析、本地过滤、结果排版抽到 search.py（纯标准库、可单测），
+            结果行格式和 /mail list 共用 format_rows()，逐字一致。
 注意：`mail` 指令**不声明任何参数**，参数直接从 event.message_str 解析。
 AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当类型调用，
 直接抛 `_empty() takes no arguments`（v0.1.0 的坑，v0.1.1 修掉）。
@@ -28,14 +31,17 @@ from astrbot.api.star import Context, Star
 try:  # 插件包内导入
     from .mailer import MailError, Mailer
     from .notify import render_notice
+    from .search import format_rows, parse_search_args
 except ImportError:  # 单独运行 / 被平铺加载时
     from mailer import MailError, Mailer  # type: ignore[no-redef]
     from notify import render_notice  # type: ignore[no-redef]
+    from search import format_rows, parse_search_args  # type: ignore[no-redef]
 
 HELP = """AgentMail 邮件工具
 · /mail send <收件人> <主题> | <正文>
   例：/mail send 123@qq.com 明天见 | 我去不了，饭钱转你了
 · /mail list [数量]   查收件箱
+· /mail search <关键词> [数量]  搜历史邮件（主题/发件人/正文，默认 5 条、最多 20）
 · /mail read <id>     看某一封
 · /mail whoami        看当前邮箱和连通状态
 · /mail here          打印当前会话 ID（填「收信推送」用）
@@ -213,14 +219,22 @@ class AgentMailPlugin(Star):
                 if not msgs:
                     yield event.plain_result("收件箱是空的。")
                     return
-                lines = []
-                for m in msgs:
-                    frm = m.get("from") or m.get("sender") or "?"
-                    ts = str(m.get("timestamp", ""))[:19]
-                    lines.append(
-                        f"{ts} · {frm}\n  {m.get('subject', '(无主题)')}\n  {m.get('message_id', '')}"
+                yield event.plain_result(format_rows(msgs))
+            elif action in ("search", "搜", "搜索"):
+                keyword, limit = parse_search_args(rest)
+                if not keyword:  # 关键词为空 → 只回用法，不去查 API
+                    yield event.plain_result(
+                        "用法：/mail search <关键词> [数量]\n"
+                        "例：/mail search 老登 3\n"
+                        "关键词可以是主题、发件人、正文预览里的任意片段（大小写不敏感），"
+                        "数量默认 5、最多 20。"
                     )
-                yield event.plain_result("\n\n".join(lines))
+                    return
+                msgs = await asyncio.to_thread(self._mailer_or_raise().search, keyword, limit)
+                if not msgs:
+                    yield event.plain_result(f"没搜到包含「{keyword}」的邮件")
+                    return
+                yield event.plain_result(format_rows(msgs))
             elif action in ("read", "读"):
                 if not rest:
                     yield event.plain_result("给我个 message_id。")

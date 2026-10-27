@@ -1,7 +1,9 @@
-"""不装 AstrBot 也能测：用假的 astrbot.api 模块桩，把插件真正跑一遍（v0.3.0）。
+"""不装 AstrBot 也能测：用假的 astrbot.api 模块桩，把插件真正跑一遍（v0.4.0）。
 
 覆盖：帮助 / 缺参 / 白名单拦截 / 真发信 / 查收件箱 / 会话ID / 收信轮询（基线+推送）
       + v0.3.0 推送模板：默认模板与 v0.2.0 逐字一致 / 自定义模板渲染 / 非法模板回退不抛异常
+      + v0.4.0 历史邮件搜索：主题/发件人/正文命中 + 大小写不敏感 + 中文 + 无结果 +
+        数量非法夹取 + 服务端搜索参数（q/limit）与本地兜底
 
 用法：
     PYTHONDONTWRITEBYTECODE=1 python3 selftest.py            # 含真实 API 抽查（没网/没 key 会自动跳过）
@@ -85,11 +87,27 @@ sys.modules.update({
 })
 
 try:
+    from astrbot_plugin_agentmail.mailer import MailError, Mailer  # noqa: E402
     from astrbot_plugin_agentmail.main import AgentMailPlugin  # noqa: E402
     from astrbot_plugin_agentmail.notify import render_notice  # noqa: E402
+    from astrbot_plugin_agentmail.search import (  # noqa: E402
+        filter_messages,
+        format_rows,
+        matches,
+        normalize_limit,
+        parse_search_args,
+    )
 except ImportError:  # 仓库根目录直接跑
+    from mailer import MailError, Mailer  # noqa: E402
     from main import AgentMailPlugin  # noqa: E402
     from notify import render_notice  # noqa: E402
+    from search import (  # noqa: E402
+        filter_messages,
+        format_rows,
+        matches,
+        normalize_limit,
+        parse_search_args,
+    )
 
 
 class FakeEvent:
@@ -121,13 +139,18 @@ class FakeContext:
 
 
 class FakeMailer:
-    """假的邮件客户端：messages 可随时替换。"""
+    """假的邮件客户端：messages 可随时替换。search 走 search.py 的本地过滤，不打网络。"""
 
     def __init__(self, messages):
         self.messages = messages
+        self.search_calls = []
 
     def list(self, limit=5):
         return self.messages[:limit]
+
+    def search(self, keyword, limit=5):
+        self.search_calls.append((keyword, limit))
+        return filter_messages(self.messages, keyword, limit)
 
 
 def read_key():
@@ -279,6 +302,138 @@ def test_notify_template():
     print("④ _compose_notice 走配置：自定义模板 / 空配置 / 非法模板（回退+warning）三种都对 ✅")
 
 
+def search_fixtures():
+    """搜索用的固定样本：主题命中 / 发件人命中 / 正文命中各一封，外加一封中文。"""
+    return [
+        {"message_id": "m-subject", "subject": "项目周报 第 3 期", "from": "boss@corp.com",
+         "timestamp": "2026-10-27T09:00:00.000Z", "preview": "本周进度见附件。"},
+        {"message_id": "m-from", "subject": "随便聊聊", "from": "Report@Corp.COM",
+         "timestamp": "2026-10-27T08:00:00.000Z", "preview": "晚上吃啥"},
+        {"message_id": "m-body", "subject": "例行同步", "from": "x@y.com",
+         "timestamp": "2026-10-27T07:00:00.000Z", "preview": "正文里顺手提了报告两个字"},
+        {"message_id": "m-cn", "subject": "老登，你太美", "from": "点点 <diandian233@agentmail.to>",
+         "timestamp": "2026-10-27T06:00:00.000Z", "preview": "没别的意思，就想写封信告诉你一句——你太美。"},
+    ]
+
+
+async def collect(handler, evt):
+    return [r async for r in handler(evt)]
+
+
+class _SpyMailer(Mailer):
+    """假 Mailer：只记它请求了哪个 path，不打网络；status≠0 时抛对应 MailError。"""
+
+    def __init__(self, messages=(), status=0, payload=None):
+        super().__init__(api_key="dummy-key", inbox="box@agentmail.to")
+        self.messages = list(messages)
+        self.status = status
+        self.payload = payload if payload is not None else {"count": 0, "messages": []}
+        self.paths = []
+        self.list_limits = []
+
+    def request(self, path, method="GET", body=None):
+        self.paths.append(path)
+        if self.status:
+            raise MailError(f"HTTP {self.status}：oops", self.status)
+        return self.payload
+
+    def list(self, limit=5):
+        self.list_limits.append(limit)
+        return self.messages[:limit]
+
+
+def ids(msgs):
+    return [m.get("message_id") for m in msgs]
+
+
+async def test_search():
+    print("\n── 历史邮件搜索（v0.4.0）──")
+    f = search_fixtures()
+
+    # ① 主题 / 发件人 / 正文预览 各命中一条
+    assert ids(filter_messages(f, "周报")) == ["m-subject"], ids(filter_messages(f, "周报"))
+    assert ids(filter_messages(f, "report@corp")) == ["m-from"], ids(filter_messages(f, "report@corp"))
+    assert ids(filter_messages(f, "报告")) == ["m-body"], ids(filter_messages(f, "报告"))
+    assert matches(f[0], "周报") and matches(f[1], "report@corp") and matches(f[2], "报告")
+    print("① 命中主题「周报」/ 发件人「report@corp」/ 正文「报告」，各一条且只各一条 ✅")
+
+    # ② 大小写不敏感 + 中文（中文没有词边界，不能用 \b）
+    assert ids(filter_messages(f, "REPORT")) == ["m-from"]
+    assert ids(filter_messages(f, "RePoRt@CoRp")) == ["m-from"]
+    assert ids(filter_messages(f, "报告"[0])) == ["m-subject", "m-body"]  # 单个汉字「报」
+    assert ids(filter_messages(f, "老登")) == ["m-cn"]        # 主题里被标点包围
+    assert ids(filter_messages(f, "太美")) == ["m-cn"]
+    assert ids(filter_messages(f, "封信")) == ["m-cn"]        # 正文预览里的中文（跨字子串）
+    print("② 大小写不敏感（REPORT / RePoRt@CoRp）+ 中文（报 / 老登 / 太美 / 封信）全命中 ✅")
+
+    # ③ 无结果 → 空列表，不抛异常
+    assert filter_messages(f, "绝对不存在zzz") == []
+    assert matches(f[0], "") is False and filter_messages(f, "") == []
+    assert Mailer(api_key="dummy").search("") == []  # 空关键词连请求都不发
+    p0 = AgentMailPlugin(FakeContext(), conf())
+    p0._mailer = FakeMailer(f)
+    out = await collect(p0.mail, FakeEvent("/mail search 绝对不存在zzz"))
+    assert out == ["没搜到包含「绝对不存在zzz」的邮件"], out
+    print("③ 无结果 → []（不抛异常），插件回：", repr(out[0]), "✅")
+
+    # ④ 关键词为空 / 数量非法
+    for raw, exp in [
+        ("", ("", 5)), ("   ", ("", 5)), ("老登", ("老登", 5)), ("老登 3", ("老登", 3)),
+        ("老登 999", ("老登", 20)), ("老登 -1", ("老登", 1)), ("老登 0", ("老登", 1)),
+        ("老登 abc", ("老登 abc", 5)), ("项目 周报 2", ("项目 周报", 2)),
+    ]:
+        got = parse_search_args(raw)
+        assert got == exp, (raw, got, exp)
+    for raw, exp in [("abc", 5), (None, 5), ("", 5), (-1, 1), (0, 1), (999, 20), ("7", 7), (True, 5)]:
+        assert normalize_limit(raw) == exp, (raw, normalize_limit(raw), exp)
+    p2 = AgentMailPlugin(FakeContext(), conf())
+    fake2 = FakeMailer(f)
+    p2._mailer = fake2
+    usage = await collect(p2.mail, FakeEvent("/mail search"))
+    assert "用法：/mail search" in usage[0], usage
+    assert fake2.search_calls == [], f"关键词为空不该打 API：{fake2.search_calls}"
+    for cmd in ("/mail search 报告 999", "/mail search 报告 -1", "/mail search 报告 abc"):
+        await collect(p2.mail, FakeEvent(cmd))
+    assert fake2.search_calls == [("报告", 20), ("报告", 1), ("报告 abc", 5)], fake2.search_calls
+    print("④ 空关键词→用法且不打 API；数量 abc→5 / -1→1 / 999→20 / 0→1 ✅")
+
+    # ⑤ 结果行格式和 /mail list 逐字一致（同一个 format_rows）
+    p1 = AgentMailPlugin(FakeContext(), conf())
+    p1._mailer = FakeMailer(f)
+    list_out = await collect(p1.mail, FakeEvent("/mail list 2"))
+    search_out = await collect(p1.mail, FakeEvent("/mail search 报 5"))
+    assert list_out == [format_rows(f[:2])], list_out
+    assert search_out == [format_rows(filter_messages(f, "报", 5))], search_out
+    assert search_out[0].count(" · ") == 2 and "\n\n" in search_out[0]
+    print("⑤ /mail search 行格式 == /mail list（共用 format_rows），多条之间空行 ✅")
+    print("   样例：", repr(search_out[0]))
+
+    # ⑥ 服务端搜索：path / 参数名（q、limit）照官方 OpenAPI
+    spy = _SpyMailer(payload={"count": 1, "messages": [f[3]]})
+    got = spy.search("老登", 3)
+    assert spy.paths == ["/inboxes/box@agentmail.to/messages/search?q=%E8%80%81%E7%99%BB&limit=3"], spy.paths
+    assert ids(got) == ["m-cn"], ids(got)
+    print("⑥ 服务端端点 + 参数名照 OpenAPI：", spy.paths[0], "✅")
+
+    # ⑦ 服务端端点不可用（400/404/405/422/501）→ 退化 list(50) 本地过滤
+    for status in (400, 404, 405, 422, 501):
+        spy2 = _SpyMailer(f, status=status)
+        got = spy2.search("报告", 5)
+        assert ids(got) == ["m-body"], (status, ids(got))
+        assert spy2.list_limits == [50], spy2.list_limits
+        assert "messages/search" in spy2.paths[0], spy2.paths
+    print("⑦ 服务端 400/404/405/422/501 → 自动退化 list(50) 本地过滤（大小写不敏感 in 匹配）✅")
+
+    # ⑧ 401 这类真错误照常抛，不吞不退化
+    try:
+        _SpyMailer(f, status=401).search("报告")
+    except MailError as e:
+        assert e.status == 401, e.status
+    else:
+        raise AssertionError("401 应该抛 MailError，而不是退化本地过滤")
+    print("⑧ 401 不退化、原样抛 MailError ✅")
+
+
 async def main():
     key = read_key()
     ctx = FakeContext()
@@ -330,6 +485,9 @@ async def main():
 
     # ── v0.3.0 推送模板 ──
     test_notify_template()
+
+    # ── v0.4.0 历史邮件搜索 ──
+    await test_search()
 
     print("\n全部断言通过 ✅")
 
