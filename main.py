@@ -19,6 +19,12 @@ v0.5.0 新增功能 A：推送时带附件。新配置 notify_attachments（默�
             true 则在清单之后用 Comp.File(name=..., url=download_url) 把附件
             跟着同一条消息链发出去（组件自己会拿 url 下载，不落临时文件）。
             取下载地址 / 发送失败只记 warning，正文和清单照发，绝不让整轮推送挂掉。
+v0.5.0 新增功能 B：每日未读摘要。新配置 digest_enabled（默认 false）、
+            digest_time（默认 "09:00"，24 小时制）、digest_sessions（留空回退
+            notify_sessions）。插件自带 asyncio 定时（不依赖外部 cron），到点统计
+            未读数量 + 最新 3 封的「时间 · 发件人 · 主题」推到目标会话；
+            用本地时间判断、同一天只推一次（最后推送日期存插件 KV，重启也不重复），
+            和收信轮询共用同一个 Mailer 实例。
 注意：`mail` 指令**不声明任何参数**，参数直接从 event.message_str 解析。
 AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当类型调用，
 直接抛 `_empty() takes no arguments`（v0.1.0 的坑，v0.1.1 修掉）。
@@ -27,6 +33,7 @@ AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当
 import asyncio
 import contextlib
 import re
+from datetime import datetime
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -42,6 +49,15 @@ try:  # 插件包内导入
         extract_attachments,
     )
     from .mailer import MailError, Mailer
+    from .digest import (
+        DIGEST_FETCH,
+        DIGEST_LATEST,
+        fmt_clock,
+        format_digest,
+        is_due,
+        next_check_delay,
+        parse_time,
+    )
     from .notify import render_notice
     from .search import format_rows, parse_search_args
 except ImportError:  # 单独运行 / 被平铺加载时
@@ -51,6 +67,15 @@ except ImportError:  # 单独运行 / 被平铺加载时
         attachment_block,
         clip_text,
         extract_attachments,
+    )
+    from digest import (  # type: ignore[no-redef]
+        DIGEST_FETCH,
+        DIGEST_LATEST,
+        fmt_clock,
+        format_digest,
+        is_due,
+        next_check_delay,
+        parse_time,
     )
     from mailer import MailError, Mailer  # type: ignore[no-redef]
     from notify import render_notice  # type: ignore[no-redef]
@@ -69,6 +94,8 @@ HELP = """AgentMail 邮件工具
 CMD_PREFIX = re.compile(r"^[/!！]?\s*(?:mail|邮件)\b\s*", re.IGNORECASE)
 SEEN_KEY = "seen_message_ids"
 SEEN_LIMIT = 200
+# 每日未读摘要「最后一次推送的本地日期」，存插件 KV，进程重启也不会重复推当天
+DIGEST_KEY = "digest_last_date"
 
 
 def _as_bool(value) -> bool:
@@ -84,10 +111,16 @@ class AgentMailPlugin(Star):
         self.conf = config or {}
         self._mailer = None
         self._poll_task = None
+        self._digest_task = None
 
     # ── 生命周期 ────────────────────────────────────────────
     async def initialize(self):
-        """插件加载完成后启动收信轮询（配了才启动）。"""
+        """插件加载完成后启动收信轮询 / 每日未读摘要（各自配了才启动）。"""
+        await self._start_poll()
+        await self._start_digest()
+
+    async def _start_poll(self):
+        """启动收信轮询（配了 poll_enabled + notify_sessions 才启动）。"""
         if not self.conf.get("poll_enabled"):
             return
         sessions = [s for s in (self.conf.get("notify_sessions") or []) if s]
@@ -99,12 +132,33 @@ class AgentMailPlugin(Star):
             f"[agentmail] 收信轮询已启动：间隔 {self._interval()}s，推送到 {len(sessions)} 个会话"
         )
 
+    async def _start_digest(self):
+        """启动每日未读摘要（配了 digest_enabled 才启动）。"""
+        if not _as_bool(self.conf.get("digest_enabled")):
+            return
+        sessions = self._digest_sessions()
+        if not sessions:
+            logger.warning(
+                "[agentmail] 开了每日未读摘要，但 digest_sessions 和 notify_sessions 都是空的，"
+                "先跑 /mail here 拿会话 ID"
+            )
+            return
+        hour, minute = self._digest_clock()
+        self._digest_task = asyncio.create_task(self._digest_loop())
+        logger.info(
+            f"[agentmail] 每日未读摘要已启动：每天 {fmt_clock(hour, minute)}（本地时间），"
+            f"推送到 {len(sessions)} 个会话"
+        )
+
     async def terminate(self):
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._poll_task
-            logger.info("[agentmail] 收信轮询已停止")
+        for name, task in (("收信轮询", self._poll_task), ("每日未读摘要", self._digest_task)):
+            if task and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                logger.info(f"[agentmail] {name}已停止")
+        self._poll_task = None
+        self._digest_task = None
 
     # ── 内部 ────────────────────────────────────────────────
     def _interval(self) -> int:
@@ -289,6 +343,87 @@ class AgentMailPlugin(Star):
         if len(atts) > MAX_SEND_ATTACHMENTS:
             errors.append(f"附件太多，只发前 {MAX_SEND_ATTACHMENTS} 个（共 {len(atts)} 个）")
         return files, errors
+
+    # ── 每日未读摘要（v0.5.0 功能 B） ─────────────────────────
+    def _digest_sessions(self) -> list[str]:
+        """摘要推到哪：digest_sessions 留空就回退 notify_sessions。"""
+        sessions = [str(s) for s in (self.conf.get("digest_sessions") or []) if s]
+        if not sessions:
+            sessions = [str(s) for s in (self.conf.get("notify_sessions") or []) if s]
+        return sessions
+
+    def _digest_clock(self) -> tuple[int, int]:
+        """`digest_time` 解析成 (时, 分)；写错了回退 09:00 并记 warning，不抛异常。"""
+        return parse_time(self.conf.get("digest_time"), warn=logger.warning)
+
+    async def _digest_loop(self):
+        """自带定时：先跑一次（进程中途启动也能补推当天），再睡到下一个到点。"""
+        await asyncio.sleep(8)  # 等 AstrBot 平台适配器就绪
+        while True:
+            try:
+                await self._digest_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 摘要出错不能把定时任务搞死
+                logger.warning(f"[agentmail] 未读摘要出错：{e}")
+            hour, minute = self._digest_clock()
+            delay = next_check_delay(datetime.now(), hour, minute)
+            logger.info(
+                f"[agentmail] 下次未读摘要：{delay / 60:.0f} 分钟后（{fmt_clock(hour, minute)}）"
+            )
+            await asyncio.sleep(delay)
+
+    async def _digest_once(self) -> dict:
+        """到点就统计未读并推一次；同一天只推一次（跨天 / 重启都安全）。"""
+        stats = {"unread": 0, "pushed": 0, "skipped": True}
+        sessions = self._digest_sessions()
+        if not sessions:
+            return stats
+        hour, minute = self._digest_clock()
+        now = datetime.now()  # 本地时间：用 UTC 判断会差 8 小时，跨天容易推两次或整天不推
+        last_date = str(await self.get_kv_data(DIGEST_KEY, "") or "")
+        if not is_due(now, hour, minute, last_date):
+            return stats
+
+        msgs = await asyncio.to_thread(self._mailer_or_raise().list, DIGEST_FETCH)
+        unread = [m for m in (msgs or []) if isinstance(m, dict) and self._is_unread(m)]
+        text = format_digest(
+            len(unread),
+            unread,
+            inbox=self.conf.get("inbox") or "",
+            now=now,
+            fetched_cap=DIGEST_FETCH,
+        )
+        stats["unread"] = len(unread)
+        for s in sessions:
+            try:
+                await self.context.send_message(s, MessageChain([Comp.Plain(text)]))
+                stats["pushed"] += 1
+            except Exception as e:  # noqa: BLE001 会话不可达只记 warning
+                logger.warning(f"[agentmail] 未读摘要推送到 {s} 失败：{e}")
+        if stats["pushed"]:
+            await self.put_kv_data(DIGEST_KEY, now.date().isoformat())
+            stats["skipped"] = False
+            logger.info(
+                f"[agentmail] 未读摘要已推送：{len(unread)} 封未读，{stats['pushed']} 个会话"
+            )
+        return stats
+
+    @staticmethod
+    def _is_unread(m: dict) -> bool:
+        """未读判定：labels 里含 unread、且不是自己发的（sent）。
+
+        没带 labels 的邮件按未读算（AgentMail 新到的就是未读，宁多不漏）。
+        """
+        labels = (m or {}).get("labels")
+        if isinstance(labels, str):
+            labels = [labels]
+        if not isinstance(labels, (list, tuple)) or not labels:
+            return True
+        low = [str(x).lower() for x in labels]
+        if "sent" in low:
+            return False
+        return "unread" in low
 
     # ── 指令 ────────────────────────────────────────────────
     # 不声明任何参数：AstrBot 的参数解析器会把 *args 的 annotation（inspect empty）

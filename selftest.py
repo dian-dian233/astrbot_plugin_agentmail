@@ -1,9 +1,14 @@
-"""不装 AstrBot 也能测：用假的 astrbot.api 模块桩，把插件真正跑一遍（v0.4.0）。
+"""不装 AstrBot 也能测：用假的 astrbot.api 模块桩，把插件真正跑一遍（v0.5.0）。
 
 覆盖：帮助 / 缺参 / 白名单拦截 / 真发信 / 查收件箱 / 会话ID / 收信轮询（基线+推送）
       + v0.3.0 推送模板：默认模板与 v0.2.0 逐字一致 / 自定义模板渲染 / 非法模板回退不抛异常
       + v0.4.0 历史邮件搜索：主题/发件人/正文命中 + 大小写不敏感 + 中文 + 无结果 +
         数量非法夹取 + 服务端搜索参数（q/limit）与本地兜底
+      + v0.5.0 功能 A 附件随推送一并送达：清单渲染 / notify_attachments=true 时消息链里
+        出现 Comp.File(name, url) / 取下载地址失败降级成清单 / 平台不支持文件组件降级 /
+        attachments 脏数据（None、字符串、空 list…）不崩 / 超长清单折叠
+      + v0.5.0 功能 B 每日未读摘要：到点触发一次 / 同一天第二次（含重启）不推 /
+        digest_time 非法回退 09:00 / 摘要正文（未读数量 + 最新 3 封）/ 会话不可达只记 warning
 
 用法：
     PYTHONDONTWRITEBYTECODE=1 python3 selftest.py            # 含真实 API 抽查（没网/没 key 会自动跳过）
@@ -13,6 +18,7 @@ import asyncio
 import os
 import sys
 import types
+from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OFFLINE = "--offline" in sys.argv
@@ -108,8 +114,14 @@ try:
         extract_attachments,
         human_size,
     )
+    from astrbot_plugin_agentmail.digest import (  # noqa: E402
+        format_digest,
+        is_due,
+        next_check_delay,
+        parse_time,
+    )
     from astrbot_plugin_agentmail.mailer import MailError, Mailer  # noqa: E402
-    from astrbot_plugin_agentmail.main import AgentMailPlugin  # noqa: E402
+    from astrbot_plugin_agentmail.main import DIGEST_KEY, AgentMailPlugin  # noqa: E402
     from astrbot_plugin_agentmail.notify import render_notice  # noqa: E402
     from astrbot_plugin_agentmail.search import (  # noqa: E402
         filter_messages,
@@ -120,8 +132,9 @@ try:
     )
 except ImportError:  # 仓库根目录直接跑
     from attach import attachment_block, extract_attachments, human_size  # noqa: E402
+    from digest import format_digest, is_due, next_check_delay, parse_time  # noqa: E402
     from mailer import MailError, Mailer  # noqa: E402
-    from main import AgentMailPlugin  # noqa: E402
+    from main import DIGEST_KEY, AgentMailPlugin  # noqa: E402
     from notify import render_notice  # noqa: E402
     from search import (  # noqa: E402
         filter_messages,
@@ -213,6 +226,9 @@ BASE_CONF = {
     "notify_preview_len": 300,
     "notify_on_first_poll": False,
     "notify_attachments": False,
+    "digest_enabled": False,
+    "digest_time": "09:00",
+    "digest_sessions": [],
 }
 
 
@@ -599,6 +615,132 @@ async def test_attach():
     print("⑤ 20 个附件 → 只列 8 条 + 「…还有 12 个」，整条推送长度 ≤ 1500 字 ✅")
 
 
+def dmail(mid, subject, ts, labels=("received", "unread"), frm="boss@corp.com"):
+    """造一封带指定时间的邮件（摘要排序用）。"""
+    m = mail(mid, subject, labels=labels, frm=frm)
+    m["timestamp"] = ts
+    return m
+
+
+async def test_digest():
+    print("\n── 每日未读摘要（v0.5.0 功能 B）──")
+    today = datetime.now().date().isoformat()
+
+    # ① 到点触发一次：3 封未读 + 2 封已读/自己发的
+    inbox = [
+        dmail("d5", "最新的这封", "2026-10-27T12:00:00.000Z"),
+        dmail("d4", "第二新", "2026-10-27T11:00:00.000Z"),
+        dmail("d3", "第三新", "2026-10-27T10:00:00.000Z"),
+        dmail("d2", "已读的", "2026-10-27T09:00:00.000Z", labels=("received", "read")),
+        dmail("d1", "自己发的", "2026-10-27T08:00:00.000Z", labels=("sent",)),
+    ]
+    ctx = FakeContext()
+    p = AgentMailPlugin(ctx, conf(digest_enabled=True, digest_time="00:00"))
+    p._mailer = FakeMailer(inbox)
+    s1 = await p._digest_once()
+    assert s1 == {"unread": 3, "pushed": 1, "skipped": False}, s1
+    assert len(ctx.sent) == 1, ctx.sent
+    session, chain = ctx.sent[0]
+    assert session == "aiocqhttp:FriendMessage:1150880493", session
+    text = chain.components[0].text
+    assert await p.get_kv_data(DIGEST_KEY, "") == today, await p.get_kv_data(DIGEST_KEY, "")
+    print("① 到点触发一次 →", s1, "｜KV 记住推送日期：", today, "✅")
+
+    # ② 同一天第二次不推（含「进程重启」：新实例共享同一份 KV，也不许重复推）
+    s2 = await p._digest_once()
+    assert s2 == {"unread": 0, "pushed": 0, "skipped": True}, s2
+    assert len(ctx.sent) == 1, "同一天不该推第二次"
+    ctx_restart = FakeContext()
+    p_restart = AgentMailPlugin(ctx_restart, conf(digest_enabled=True, digest_time="00:00"))
+    p_restart._kv = dict(p._kv)  # 模拟重启后读回同一份插件 KV
+    p_restart._mailer = FakeMailer(inbox)
+    s2b = await p_restart._digest_once()
+    assert s2b["pushed"] == 0 and ctx_restart.sent == [], s2b
+    print("② 同一天第二次不推 + 重启后（KV 里已有今天）也不重复推 ✅")
+
+    # ②′ 跨天逻辑用纯函数验（不依赖跑测的时刻）：不到点不推 / 到点推 / 隔天再推
+    assert is_due(datetime(2026, 10, 27, 8, 59), 9, 0, "") is False
+    assert is_due(datetime(2026, 10, 27, 9, 0), 9, 0, "") is True
+    assert is_due(datetime(2026, 10, 27, 9, 0), 9, 0, "2026-10-27") is False
+    assert is_due(datetime(2026, 10, 28, 9, 0), 9, 0, "2026-10-27") is True
+    assert is_due(datetime(2026, 10, 27, 23, 59), 9, 0, "") is True  # 中途启动补推当天
+    assert 0 < next_check_delay(datetime(2026, 10, 27, 8, 0), 9, 0) == 3600
+    assert next_check_delay(datetime(2026, 10, 27, 9, 0), 9, 0) == 86400
+    print("②′ is_due 纯函数：08:59 不推 / 09:00 推 / 当天已推不推 / 隔天再推 / 23:59 补推 ✅")
+
+    # ③ digest_time 格式非法 → 回退 09:00 + warning，不抛异常
+    bad_times = ["25:00", "9点", "", "9:70", "abc", "24:00", "09:00:00"]
+    for raw in bad_times:
+        WARNINGS.clear()
+        assert parse_time(raw, warn=_warn) == (9, 0), raw
+        assert any("digest_time" in w for w in WARNINGS), (raw, WARNINGS)
+    for raw, exp in [("09:00", (9, 0)), ("7:30", (7, 30)), ("21：30", (21, 30)), ("0:00", (0, 0)), (None, (9, 0))]:
+        WARNINGS.clear()
+        assert parse_time(raw, warn=_warn) == exp, (raw, parse_time(raw, warn=_warn))
+        assert WARNINGS == [], (raw, WARNINGS)
+    WARNINGS.clear()
+    p_bad = AgentMailPlugin(FakeContext(), conf(digest_enabled=True, digest_time="25:00"))
+    assert p_bad._digest_clock() == (9, 0) and any("digest_time" in w for w in WARNINGS)
+    print("③ digest_time 非法（25:00 / 9点 / 空 / 9:70 / abc / 24:00 / 09:00:00）→ 全回退 09:00 + warning，零异常 ✅")
+    print("   合法写法 09:00 / 7:30 / 21：30 / 0:00 / 未配置(默认) 都不吵 warning ✅")
+
+    # ④ 摘要正文内容：数量 + 最新 3 封的「时间 · 发件人 · 主题」
+    assert "未读邮件：3 封" in text, text
+    assert "最新 3 封：" in text, text
+    lines = [ln for ln in text.splitlines() if ln[:2] in ("1.", "2.", "3.")]
+    assert len(lines) == 3, lines
+    assert "最新的这封" in lines[0] and "第二新" in lines[1] and "第三新" in lines[2], lines
+    for ln in lines:  # 时间 · 发件人 · 主题
+        assert ln.count(" · ") == 2, ln
+    assert "boss@corp.com" in lines[0], lines[0]
+    print("④ 摘要正文 →", repr(text.splitlines()[0]), "｜", repr(lines[0]))
+    assert "未读邮件：3 封" in text and len(lines) == 3
+    print("④ 正文内容正确：数量（3 封）+ 最新 3 封倒序（时间 · 发件人 · 主题）✅")
+
+    # ④′ 0 封未读 / 拉满 50 封两种边界文案
+    assert "未读邮件：0 封，邮箱是干净的" in format_digest(0, [])
+    assert "未读邮件：50+ 封" in format_digest(50, inbox[:3])
+    print("④′ 边界：0 封 →「邮箱是干净的」，拉满 50 封 →「50+ 封」✅")
+
+    # ⑤ digest_sessions 留空 → 回退 notify_sessions；会话不可达 → 只记 warning
+    ctx5 = FakeContext()
+    p5 = AgentMailPlugin(ctx5, conf(digest_enabled=True, digest_time="00:00", digest_sessions=[]))
+    p5._mailer = FakeMailer(inbox)
+    assert p5._digest_sessions() == ["aiocqhttp:FriendMessage:1150880493"], p5._digest_sessions()
+    ctx6 = FakeContext()
+    p6 = AgentMailPlugin(
+        ctx6, conf(digest_enabled=True, digest_time="00:00", digest_sessions=["aiocqhttp:GroupMessage:999"])
+    )
+    p6._mailer = FakeMailer(inbox)
+    assert p6._digest_sessions() == ["aiocqhttp:GroupMessage:999"]
+    s5 = await p5._digest_once()
+    assert s5["pushed"] == 1 and ctx5.sent[0][0] == "aiocqhttp:FriendMessage:1150880493", s5
+
+    class _DeadContext(FakeContext):
+        async def send_message(self, session, chain):
+            raise RuntimeError("会话不可达")
+
+    p7 = AgentMailPlugin(_DeadContext(), conf(digest_enabled=True, digest_time="00:00"))
+    p7._mailer = FakeMailer(inbox)
+    WARNINGS.clear()
+    s7 = await p7._digest_once()
+    assert s7["pushed"] == 0 and s7["skipped"] is True, s7
+    assert any("未读摘要推送到" in w for w in WARNINGS), WARNINGS
+    assert await p7.get_kv_data(DIGEST_KEY, "") == "", "一个会话都没推成功时不该标记今天已推"
+    print("⑤ digest_sessions 留空回退 notify_sessions；推送失败只记 warning 且不标记当天 ✅")
+
+    # ⑥ 和收信轮询共用同一个 Mailer 实例（不另开连接）
+    ctx8 = FakeContext()
+    p8 = AgentMailPlugin(ctx8, conf(digest_enabled=True, digest_time="00:00"))
+    shared = FakeMailer(inbox)
+    p8._mailer = shared
+    assert p8._mailer_or_raise() is shared
+    await p8._digest_once()
+    await p8._poll_once()
+    assert p8._mailer is shared, "摘要和轮询必须共用同一个 Mailer"
+    print("⑥ 摘要和收信轮询共用同一个 Mailer 实例（同一个 _mailer_or_raise）✅")
+
+
 async def main():
     key = read_key()
     ctx = FakeContext()
@@ -656,6 +798,9 @@ async def main():
 
     # ── v0.5.0 功能 A：附件随推送一并送达 ──
     await test_attach()
+
+    # ── v0.5.0 功能 B：每日未读摘要 ──
+    await test_digest()
 
     print("\n全部断言通过 ✅")
 
