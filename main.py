@@ -7,9 +7,11 @@
     /mail whoami
 
 也注册了 LLM 工具 `agentmail_send`，所以「给老登发封邮件说明天见」这种自然语言也能直接触发。
-"""
 
-from __future__ import annotations
+注意：`mail` 指令**不声明任何参数**，参数直接从 event.message_str 里解析。
+AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当成类型去调用，
+直接抛 `_empty() takes no arguments`（v0.1.0 的坑，v0.1.1 修掉）。
+"""
 
 import asyncio
 import re
@@ -34,13 +36,13 @@ CMD_PREFIX = re.compile(r"^[/!！]?\s*(?:mail|邮件)\b\s*", re.IGNORECASE)
 
 
 class AgentMailPlugin(Star):
-    def __init__(self, context: Context, config: dict | None = None):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.conf = config or {}
-        self._mailer: Mailer | None = None
+        self._mailer = None
 
     # ── 内部 ────────────────────────────────────────────────
-    def _mailer_or_raise(self) -> Mailer:
+    def _mailer_or_raise(self):
         if self._mailer is None:
             self._mailer = Mailer(
                 api_key=self.conf.get("api_key", ""),
@@ -50,7 +52,7 @@ class AgentMailPlugin(Star):
             )
         return self._mailer
 
-    def _allowed(self, event: AstrMessageEvent) -> bool:
+    def _allowed(self, event) -> bool:
         """白名单：allow_all / 管理员 / 指定用户 / 指定群。"""
         if self.conf.get("allow_all"):
             return True
@@ -63,28 +65,32 @@ class AgentMailPlugin(Star):
         group = str(event.get_group_id() or "")
         users = [str(x) for x in (self.conf.get("allowed_users") or [])]
         groups = [str(x) for x in (self.conf.get("allowed_groups") or [])]
-        return (sender and sender in users) or (group and group in groups)
+        return bool((sender and sender in users) or (group and group in groups))
 
     @staticmethod
-    def _args(event: AstrMessageEvent) -> str:
+    def _args(event) -> str:
+        """从消息文本里剥掉指令前缀，拿到后续参数。"""
         raw = (getattr(event, "message_str", "") or "").strip()
-        return CMD_PREFIX.sub("", raw, count=1).strip()
+        stripped = CMD_PREFIX.sub("", raw, count=1).strip()
+        return stripped if stripped != raw.strip() else raw.strip()
 
     # ── 指令 ────────────────────────────────────────────────
+    # 不声明任何参数：AstrBot 的参数解析器会把 *args 的 annotation（inspect empty）
+    # 当成类型去调用，导致 `_empty() takes no arguments`。参数自己解析最省事。
     @filter.command("mail", alias={"邮件"})
-    async def mail(self, event: AstrMessageEvent, *args):
+    async def mail(self, event: AstrMessageEvent):
         """AgentMail 邮件工具：发信 / 查收件箱 / 读邮件。"""
         if not self._allowed(event):
             yield event.plain_result("这个会话没开邮件权限，找管理员把你的 QQ 或群号加进白名单。")
             return
 
-        text = " ".join(args).strip() or self._args(event)
+        text = self._args(event)
         if not text:
             yield event.plain_result(HELP)
             return
 
         action, _, rest = text.partition(" ")
-        action = action.lower()
+        action = action.strip().lower()
         rest = rest.strip()
 
         try:
@@ -102,8 +108,9 @@ class AgentMailPlugin(Star):
                 lines = []
                 for m in msgs:
                     frm = m.get("from") or m.get("sender") or "?"
+                    ts = str(m.get("timestamp", ""))[:19]
                     lines.append(
-                        f"{str(m.get('timestamp', ''))[:19]} · {frm}\n  {m.get('subject', '(无主题)')}\n  {m.get('message_id', '')}"
+                        f"{ts} · {frm}\n  {m.get('subject', '(无主题)')}\n  {m.get('message_id', '')}"
                     )
                 yield event.plain_result("\n\n".join(lines))
             elif action in ("read", "读"):
@@ -130,7 +137,7 @@ class AgentMailPlugin(Star):
             yield event.plain_result(f"出错了：{e}")
 
     @staticmethod
-    def _parse_send(rest: str) -> tuple[list[str], str, str]:
+    def _parse_send(rest: str):
         """解析 `收件人 主题 | 正文`，也兼容用换行分隔。"""
         body = ""
         if "|" in rest:

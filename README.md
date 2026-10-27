@@ -80,6 +80,7 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
+| `_empty() takes no arguments` | **v0.1.0 的 bug，v0.1.1 已修**：指令 handler 里用了 `*args`，AstrBot 的参数解析器会把 `inspect.Parameter.empty` 当类型去调用。升级到 0.1.1 即可（handler 不再声明参数，自己从 `event.message_str` 解析） |
 | `401` | key 错了或者被 rotate 了，回面板重新生成 |
 | `404 Route not found` | base 路径不对；本项目用的是 `/v0`，不是 `/v1` |
 | `被网关拦截（返回 HTML 页面）` | 没连上 AgentMail，是本地网关吐的页面 → 配置里填 `proxy` |
