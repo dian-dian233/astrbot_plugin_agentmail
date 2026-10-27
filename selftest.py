@@ -11,8 +11,10 @@
         digest_time 非法回退 09:00 / 摘要正文（未读数量 + 最新 3 封）/ 会话不可达只记 warning
 
 用法：
-    PYTHONDONTWRITEBYTECODE=1 python3 selftest.py            # 含真实 API 抽查（没网/没 key 会自动跳过）
-    PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline  # 只跑本地断言
+    PYTHONDONTWRITEBYTECODE=1 python3 selftest.py            # 含真实 API 抽查（没 key/没网 自动降级为 offline）
+    PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline  # 只跑本地断言（不需要真 key，用假的 am_test_dummy）
+
+CI 里跑的就是 --offline：不读 ~/.secrets/agentmail.key、不连网络，纯本地断言。
 """
 import asyncio
 import os
@@ -24,6 +26,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OFFLINE = "--offline" in sys.argv
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))  # 兼容放在 plugins/ 下、以包形式导入
+
+# --offline（以及没凭证时自动降级）用的假 key：所有断言都是桩，不会真的打网络。
+DUMMY_KEY = "am_test_dummy"
 
 WARNINGS = []
 
@@ -120,7 +125,7 @@ try:
         next_check_delay,
         parse_time,
     )
-    from astrbot_plugin_agentmail.mailer import MailError, Mailer  # noqa: E402
+    from astrbot_plugin_agentmail.mailer import Mailer, MailError  # noqa: E402
     from astrbot_plugin_agentmail.main import DIGEST_KEY, AgentMailPlugin  # noqa: E402
     from astrbot_plugin_agentmail.notify import render_notice  # noqa: E402
     from astrbot_plugin_agentmail.search import (  # noqa: E402
@@ -133,7 +138,7 @@ try:
 except ImportError:  # 仓库根目录直接跑
     from attach import attachment_block, extract_attachments, human_size  # noqa: E402
     from digest import format_digest, is_due, next_check_delay, parse_time  # noqa: E402
-    from mailer import MailError, Mailer  # noqa: E402
+    from mailer import Mailer, MailError  # noqa: E402
     from main import DIGEST_KEY, AgentMailPlugin  # noqa: E402
     from notify import render_notice  # noqa: E402
     from search import (  # noqa: E402
@@ -742,7 +747,22 @@ async def test_digest():
 
 
 async def main():
+    global OFFLINE
     key = read_key()
+    real_api = True
+    if OFFLINE:
+        # 离线模式：不需要真 key，用假 key 跑（断言全是桩，不打网络）
+        key = key or DUMMY_KEY
+        real_api = False
+        print(f"[offline] 只跑本地断言，使用假 key {DUMMY_KEY!r}")
+    elif not key:
+        # 没 --offline 又读不到 key：友好提示后自动降级，不要 traceback
+        print("[提示] 没找到 ~/.secrets/agentmail.key —— 自动降级为 offline 模式（只跑本地断言，不连网络）。")
+        print("       想要真连抽查：把 AgentMail 的 API Key 写进 ~/.secrets/agentmail.key 再跑一遍。")
+        OFFLINE = True
+        key = DUMMY_KEY
+        real_api = False
+
     ctx = FakeContext()
     p = AgentMailPlugin(ctx, conf(**{"api_key": key}))
 
@@ -751,7 +771,7 @@ async def main():
     await run(p.mail, FakeEvent("/mail send 1150880493@qq.com 拦截测试 | 不该发出去",
                                 admin=False, sender="999"), "非白名单 → 拦截")
     await run(p.mail, FakeEvent("/mail here"), "拿当前会话 ID")
-    if key and not OFFLINE:
+    if real_api:
         try:
             await run(p.mail, FakeEvent("/mail list 1"), "查收件箱（真连 API）")
         except Exception as e:  # noqa: BLE001 网络抽查失败不算单测失败

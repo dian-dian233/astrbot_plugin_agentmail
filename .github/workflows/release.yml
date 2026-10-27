@@ -1,0 +1,216 @@
+name: Release
+
+# 打 tag（v*）时：校验 tag ↔ metadata.yaml 的 version → 打包 zip → 建 Release 并挂 zip。
+# 也支持 workflow_dispatch：只做「校验 + 打包 + 上传 artifact」，默认不发布（用来演练/验证流程）。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要校验的 tag（留空则用 metadata.yaml 的 version 自动拼 v 前缀）"
+        required: false
+        default: ""
+      publish:
+        description: "勾上才真的建 Release（默认只校验 + 打包）"
+        required: false
+        type: boolean
+        default: false
+
+# 最小权限：默认只读；只有真正建 Release 的 job 额外给 contents: write。
+permissions:
+  contents: read
+
+env:
+  PLUGIN_NAME: astrbot_plugin_agentmail
+
+jobs:
+  verify:
+    name: 校验 tag 与 metadata.version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      should_publish: ${{ steps.resolve.outputs.should_publish }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 解析 tag 并校验版本一致
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_PUBLISH: ${{ github.event.inputs.publish }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            tag="$REF_NAME"
+            publish="true"
+          else
+            tag="$INPUT_TAG"
+            publish="${INPUT_PUBLISH:-false}"
+          fi
+
+          if [ -z "$tag" ]; then
+            # workflow_dispatch 没填 tag：用 metadata.yaml 的 version 拼一个
+            tag=$(python3 .github/scripts/check_version.py --print-tag)
+            echo "未指定 tag，按 metadata.yaml 推导出 $tag"
+          fi
+          echo "目标 tag = $tag（publish=$publish）"
+
+          version=$(python3 .github/scripts/check_version.py "$tag")
+          echo "✅ tag 与 metadata.yaml 版本一致：$tag（version=$version）"
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "should_publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+  package:
+    name: 打包 zip
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: 打包（插件文件夹 astrbot_plugin_agentmail/ 放 zip 顶层）
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          zipname="${PLUGIN_NAME}-${VERSION}.zip"
+          stage="stage/${PLUGIN_NAME}"
+          mkdir -p dist "$stage"
+
+          # 只搬运行期需要的文件，统一塞进 astrbot_plugin_agentmail/ 文件夹
+          for f in *.py *.json *.yaml *.md LICENSE requirements.txt; do
+            [ -e "$f" ] && cp "$f" "$stage/" || true
+          done
+
+          # 排除测试文件、缓存、VCS 元数据、CI 自身
+          rm -f "$stage/selftest.py"
+          find stage -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find stage -name '*.pyc' -delete 2>/dev/null || true
+          find stage -name '.git*' -prune -exec rm -rf {} + 2>/dev/null || true
+
+          # 顶层就是插件文件夹：解压后整文件夹丢进 data/plugins/ 即可
+          (cd stage && zip -rq "../dist/$zipname" "$PLUGIN_NAME")
+
+          echo "── zip 前 20 行（$zipname）──"
+          unzip -l "dist/$zipname" | head -20
+
+          listing=$(unzip -Z1 "dist/$zipname")
+
+          # 1) 三件套必须在 astrbot_plugin_agentmail/ 里面
+          for f in main.py metadata.yaml _conf_schema.json; do
+            printf '%s\n' "$listing" | grep -qx "${PLUGIN_NAME}/${f}" || {
+              echo "::error::${PLUGIN_NAME}/${f} 不在 zip 里，解压后装不上"
+              exit 1
+            }
+          done
+
+          # 2) 顶层只能有这一个文件夹，不能有散落文件（否则解压后进错目录）
+          loose=$(printf '%s\n' "$listing" | grep -v "^${PLUGIN_NAME}/" || true)
+          if [ -n "$loose" ]; then
+            echo "::error::zip 顶层有散落条目，应为纯文件夹结构："
+            printf '%s\n' "$loose"
+            exit 1
+          fi
+
+          # 3) 不能有 './' 前缀（部分解压实现会把它当成子目录）
+          if printf '%s\n' "$listing" | grep -q '^\./'; then
+            echo "::error::zip 里有 './' 前缀条目，包结构不对"
+            exit 1
+          fi
+
+          echo "✅ zip 结构 OK：顶层是 ${PLUGIN_NAME}/ 文件夹，解压后整文件夹丢进 data/plugins/ 即可"
+
+      - name: 上传 artifact（演练时可直接下载检查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}-${{ needs.verify.outputs.version }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: 建 Release
+    needs: [verify, package]
+    if: needs.verify.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载打包好的 zip
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_NAME }}-${{ needs.verify.outputs.version }}
+          path: dist
+
+      - name: 用 git log 生成 release notes
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          prev=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            title="## 变更（$prev → $TAG）"
+            range="$prev..$TAG"
+          else
+            title="## 变更（首个 tag）"
+            range="$TAG"
+          fi
+          {
+            echo "$title"
+            echo
+            git log --no-merges --pretty=format:'- %s (%h)' "$range"
+            echo
+            echo
+            echo "## 安装"
+            echo
+            echo '下载下面的 zip，解压后把 **`astrbot_plugin_agentmail/` 整个文件夹**丢进 `AstrBot/data/plugins/`，再到 WebUI 重载插件 / 重启容器。'
+            echo
+            echo '```bash'
+            echo 'cd /path/to/AstrBot/data/plugins'
+            echo "unzip ${PLUGIN_NAME}-${VERSION}.zip   # 解出 ${PLUGIN_NAME}/ 文件夹"
+            echo '```'
+            echo
+            echo '也可以在 WebUI 里直接填仓库地址安装。'
+            echo
+            echo "## 自测"
+            echo
+            echo '```bash'
+            echo 'PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline'
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: 建 Release（GH_TOKEN = 默认 GITHUB_TOKEN）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/*.zip \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --verify-tag

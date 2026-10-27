@@ -1,5 +1,8 @@
 # astrbot_plugin_agentmail
 
+[![CI](https://github.com/dian-dian233/astrbot_plugin_agentmail/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dian-dian233/astrbot_plugin_agentmail/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/dian-dian233/astrbot_plugin_agentmail?display_name=tag&sort=semver)](https://github.com/dian-dian233/astrbot_plugin_agentmail/releases/latest)
+
 给 AstrBot 加一个**真正能用**的邮箱：任意私聊、任意群聊都能发邮件、查收件箱，也注册了 LLM 工具，直接说「给老登发封邮件」就行。
 
 底层是 [AgentMail](https://agentmail.to)（给 AI agent 用的邮件服务），不依赖沙盒、不依赖 bootstrap，装满配好就能用。
@@ -19,6 +22,16 @@ https://github.com/dian-dian233/astrbot_plugin_agentmail
 ```bash
 cd /opt/dockerApp/AstrBot/data/plugins   # 换成你的路径
 git clone https://github.com/dian-dian233/astrbot_plugin_agentmail.git
+# 然后 WebUI 里重载插件 / 重启 astrbot 容器
+```
+
+**方式三：zip 压缩包（GitHub Release 下载）**
+
+去 [Releases](https://github.com/dian-dian233/astrbot_plugin_agentmail/releases/latest) 下 `astrbot_plugin_agentmail-<version>.zip`，**zip 顶层就是 `astrbot_plugin_agentmail/` 文件夹**：
+
+```bash
+cd /path/to/AstrBot/data/plugins
+unzip ~/Downloads/astrbot_plugin_agentmail-0.5.1.zip   # 直接解出 astrbot_plugin_agentmail/ 文件夹
 # 然后 WebUI 里重载插件 / 重启 astrbot 容器
 ```
 
@@ -269,6 +282,46 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 | 到点没收到每日摘要 | 看 `digest_enabled` 是否打开、`digest_sessions`（或 `notify_sessions`）是否填了会话 ID、`digest_time` 格式对不对；日志关键字「每日未读摘要」 |
 
 日志关键字：`[agentmail]`
+
+## CI/CD 与发版
+
+`.github/workflows/` 里两个工作流，跑在 GitHub Actions 上。**不用任何 secrets**，只吃默认的 `GITHUB_TOKEN`，权限在 yml 里显式声明为最小（CI 只 `contents: read`，发版只有建 Release 的那个 job 拿 `contents: write`）。
+
+### CI：`.github/workflows/ci.yml`
+
+push 到任意分支、以及所有 PR 都会跑：
+
+| job | 干什么 |
+| --- | --- |
+| `lint + selftest (py3.12 / py3.13)` | `python -m compileall -q .` → `ruff check .` → `PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline` |
+| `manifest 体检` | `metadata.yaml` 能被 YAML 解析、必填字段（name/display_name/desc/version/author/repo/astrbot_version）齐全、`repo` 等于当前仓库地址、`name` 等于仓库名；`_conf_schema.json` 是合法 JSON 且每项都有 `description`/`type`/`default` |
+
+Python 矩阵只放 `3.12` / `3.13`：AstrBot 自己的约束是 `requires-python = ">=3.12"`（见 `astrbot_src/pyproject.toml`），3.10 / 3.11 上的兼容性没有意义。
+
+本地复现（和 CI 完全一致）：
+
+```bash
+pip install ruff
+ruff check .                                     # 规则见 ruff.toml：行宽 120、target py312、E/W/F/I/B/C4
+PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline
+```
+
+`selftest.py --offline` 不需要真 key，用假的 `am_test_dummy` 跑（断言全是桩、不打网络）；不带 `--offline` 又读不到 `~/.secrets/agentmail.key` 时，会打一行提示然后自动降级成离线模式，不会抛 traceback。
+
+### 发版：`.github/workflows/release.yml`
+
+打 tag 就发版。唯一硬要求：**tag 必须和 `metadata.yaml` 里的 `version` 一致**，不一致直接红并告诉你该怎么做（这是最容易翻的车）。
+
+```bash
+# 1. 先把 metadata.yaml 里的 version 改成 0.5.1，提交、推到 main
+# 2. 再打 tag（v 前缀 + 同一个版本号）
+git tag v0.5.1
+git push origin v0.5.1
+```
+
+然后工作流会：校验 tag ↔ version → 打包 `astrbot_plugin_agentmail-<version>.zip`（zip **顶层就是 `astrbot_plugin_agentmail/` 文件夹**，里面的 `metadata.yaml` / `main.py` / `_conf_schema.json` 一应俱全；已排除 `__pycache__` / `.git` / `selftest.py` / CI 自身）→ 用 `gh release create` 建 Release、挂上 zip，release notes 自动取 `git log`（上一个 tag 到这次的提交）。
+
+不想为了验证就污染仓库？用 **workflow_dispatch**：Actions → Release → Run workflow，只做「校验 tag ↔ version + 打包 + 上传 artifact」，默认**不**建 Release（想真发才勾 `publish`）。也可以故意填错 tag（如 `v9.9.9`）看它红。
 
 ## 原理备忘
 
