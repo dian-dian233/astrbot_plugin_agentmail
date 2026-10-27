@@ -1,0 +1,8 @@
+name: astrbot_plugin_agentmail
+display_name: AgentMail 邮件
+desc: 用 AgentMail 收发邮件：/mail 指令 + LLM 工具，私聊和群聊都能用，支持直连/代理自动切换
+short_desc: AgentMail 邮件工具
+version: 0.1.0
+author: dian-dian233
+repo: https://github.com/dian-dian233/astrbot_plugin_agentmail
+astrbot_version: ">=4.9.0"

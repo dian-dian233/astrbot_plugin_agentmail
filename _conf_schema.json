@@ -1,0 +1,44 @@
+{
+  "api_key": {
+    "description": "AgentMail API Key",
+    "type": "string",
+    "hint": "在 https://console.agentmail.to/dashboard/api-keys 生成，形如 am_us_...",
+    "default": ""
+  },
+  "inbox": {
+    "description": "发信用的收件箱地址",
+    "type": "string",
+    "hint": "AgentMail 里已创建的 inbox，例如 diandian233@agentmail.to",
+    "default": "diandian233@agentmail.to"
+  },
+  "proxy": {
+    "description": "HTTP 代理（可留空）",
+    "type": "string",
+    "hint": "留空表示直连；如果日志里出现「被网关拦截（返回 HTML 页面）」，填 http://IP:端口",
+    "default": ""
+  },
+  "timeout": {
+    "description": "请求超时（秒）",
+    "type": "int",
+    "hint": "默认 30",
+    "default": 30
+  },
+  "allow_all": {
+    "description": "允许所有会话使用",
+    "type": "bool",
+    "hint": "关掉后仅管理员和三张白名单可用（推荐关掉，避免别人拿你的邮箱乱发）",
+    "default": false
+  },
+  "allowed_users": {
+    "description": "允许使用的用户 ID",
+    "type": "list",
+    "hint": "填 QQ 号 / 平台用户 ID，一行一个",
+    "default": []
+  },
+  "allowed_groups": {
+    "description": "允许使用的群号",
+    "type": "list",
+    "hint": "整群可用就填群号，一行一个",
+    "default": []
+  }
+}
