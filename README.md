@@ -43,6 +43,7 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 | `notify_preview_len` | 推送里的正文预览字数，默认 300 |
 | `notify_template` | 推送文案模板，**留空=内置文案**。可用占位符 `{subject}` `{from}` `{preview}` `{time}` `{inbox}`；写错（未知占位符、花括号没闭合）会自动回退内置文案并记 warning，不会报错 |
 | `notify_on_first_poll` | 首次轮询是否推送历史邮件，建议保持关（首次只记基线，不刷屏） |
+| `notify_attachments` | 新邮件带附件时是否把**附件文件一起发出去**，默认关。关＝只在推送里追加附件清单（文件名 + 大小 + 类型）；开＝清单之后再用文件组件逐个发文件，失败自动降级成清单 |
 
 > ⚠️ 建议保持 `allow_all=false`：邮箱是你的，别人能用了就能以你的名义发信。群聊要用就填 `allowed_groups`。
 
@@ -152,6 +153,44 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 
 模板写坏了（比如 `{foo}`、`{subject` 没闭合、`{subject!r}`）**不会报错**：自动回退内置文案，日志里留一条 warning，`[agentmail] 推送模板不可用，已回退内置文案：…`。
 
+### 附件随推送一并送达（v0.5.0）
+
+新邮件带附件时，不再只有一句「正文预览」，而是把附件也一起交代清楚。开关是
+`notify_attachments`（默认 **关**）：
+
+| 值 | 行为 |
+| --- | --- |
+| `false`（默认） | 推送文案末尾追加**附件清单**：文件名 + 可读大小 + 类型，例如 `· report.pdf（12.3KB · application/pdf）`。不下载、不发文件，只让你知道有附件 |
+| `true` | 清单照旧，然后**在同一个消息链里**把附件逐个发出去 |
+
+推送长这样（`notify_attachments=false`，有 2 个附件时）：
+
+```
+📬 新邮件
+主题：带附件的邮件
+发件人：someone@qq.com
+时间：2026-10-27T10:00:00
+────────────
+正文预览…
+────────────
+📎 附件 2 个
+· report.pdf（12.3KB · application/pdf）
+· 数据.csv（3.1MB · text/csv）
+```
+
+实现上的几个要点：
+
+- 发文件用的是 **`Comp.File(name=<文件名>, url=<download_url>)`**：`File.file` 这个
+  property 会自己拿 `url` 去下载，**不用落临时文件**；整条消息链是「一段文字 + N 个文件组件」
+- `download_url` 来自 `GET /v0/inboxes/{inbox}/messages/{message_id}/attachments/{attachment_id}`，
+  是**带签名、会过期**的临时地址，每次发送前现取，不做任何缓存
+- **失败只降级、不炸**：取不到下载地址 → 该附件留在文字清单里 + 一条 warning，正文照发；
+  平台不支持文件组件（发送抛异常）→ 自动降级成纯文字清单重试一次 + 一条 warning
+- 一封邮件最多发 5 个附件、清单最多列 8 条（再多折叠成「…还有 N 个」），
+  整条推送长度上限 1500 字，不会把消息塞爆
+- `attachments` 字段缺失 / 是 `None` / 是字符串 / 是空 list / 元素不是对象 → 安全跳过，
+  文案和没有附件时逐字一致
+
 例子：
 
 ```
@@ -198,6 +237,10 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 ```
 /mail send ...  →  Mailer.send()  →  POST /v0/inboxes/{inbox}/messages/send
                                      Authorization: Bearer <api_key>
+
+收信推送 + 附件 → Mailer.list()           →  GET  /v0/inboxes/{inbox}/messages
+                → Mailer.attachment_info() →  GET  /v0/inboxes/{inbox}/messages/{id}/attachments/{aid}
+                                             →  download_url（带签名、会过期，现取现用）
 ```
 
 接口文档：<https://docs.agentmail.to>（OpenAPI：<https://docs.agentmail.to/openapi.json>，注意路径是 `/v0`）

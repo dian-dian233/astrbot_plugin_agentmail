@@ -9,6 +9,8 @@
    OpenAPI：只有 `q` / `limit` / `page_token` / `before` / `after`，没有 body）。
    该端点报 400/404/405/422/501（例如套餐或权限不支持）时，自动退化为
    `list(50)` 拉下来用 search.py 里的纯函数本地过滤，并在日志里记一条 warning。
+4. v0.5.0 加了 `attachment_info()`：拿附件的 `download_url`（带签名、会过期，
+   所以每次发附件都重新问一次，不做任何缓存）。
 """
 
 from __future__ import annotations
@@ -172,6 +174,24 @@ class Mailer:
 
     def read(self, message_id: str) -> dict:
         return self.request(f"/inboxes/{self.inbox}/messages/{message_id}")
+
+    def attachment_info(self, message_id: str, attachment_id: str) -> dict:
+        """取附件的下载信息（v0.5.0）。
+
+        `GET /v0/inboxes/{inbox}/messages/{message_id}/attachments/{attachment_id}`
+        → `{download_url, text_url?, expires_at, ...}`。
+
+        ⚠️ `download_url` 是带签名的临时地址，**会过期、不许缓存**，
+        每次要发附件都重新问一次接口。
+        """
+        mid = str(message_id or "").strip()
+        aid = str(attachment_id or "").strip()
+        if not mid or not aid:
+            raise MailError("附件下载信息缺少 message_id 或 attachment_id")
+        return self.request(
+            f"/inboxes/{self.inbox}/messages/{urllib.parse.quote(mid, safe='')}"
+            f"/attachments/{urllib.parse.quote(aid, safe='')}"
+        )
 
     def whoami(self) -> dict:
         return self.request(f"/inboxes/{self.inbox}")

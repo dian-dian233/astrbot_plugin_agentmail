@@ -14,6 +14,11 @@ v0.3.0 新增：推送文案可配（notify_template，占位符 {subject} {from
 v0.4.0 新增：/mail search <关键词> [数量]，搜历史邮件（主题 / 发件人 / 正文预览），
             解析、本地过滤、结果排版抽到 search.py（纯标准库、可单测），
             结果行格式和 /mail list 共用 format_rows()，逐字一致。
+v0.5.0 新增功能 A：推送时带附件。新配置 notify_attachments（默认 false）——
+            false 只在推送文案里追加「附件清单」（文件名 + 可读大小 + 类型），
+            true 则在清单之后用 Comp.File(name=..., url=download_url) 把附件
+            跟着同一条消息链发出去（组件自己会拿 url 下载，不落临时文件）。
+            取下载地址 / 发送失败只记 warning，正文和清单照发，绝不让整轮推送挂掉。
 注意：`mail` 指令**不声明任何参数**，参数直接从 event.message_str 解析。
 AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当类型调用，
 直接抛 `_empty() takes no arguments`（v0.1.0 的坑，v0.1.1 修掉）。
@@ -29,10 +34,24 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 
 try:  # 插件包内导入
+    from .attach import (
+        MAX_SEND_ATTACHMENTS,
+        NOTICE_MAX_CHARS,
+        attachment_block,
+        clip_text,
+        extract_attachments,
+    )
     from .mailer import MailError, Mailer
     from .notify import render_notice
     from .search import format_rows, parse_search_args
 except ImportError:  # 单独运行 / 被平铺加载时
+    from attach import (  # type: ignore[no-redef]
+        MAX_SEND_ATTACHMENTS,
+        NOTICE_MAX_CHARS,
+        attachment_block,
+        clip_text,
+        extract_attachments,
+    )
     from mailer import MailError, Mailer  # type: ignore[no-redef]
     from notify import render_notice  # type: ignore[no-redef]
     from search import format_rows, parse_search_args  # type: ignore[no-redef]
@@ -50,6 +69,13 @@ HELP = """AgentMail 邮件工具
 CMD_PREFIX = re.compile(r"^[/!！]?\s*(?:mail|邮件)\b\s*", re.IGNORECASE)
 SEEN_KEY = "seen_message_ids"
 SEEN_LIMIT = 200
+
+
+def _as_bool(value) -> bool:
+    """配置里的 bool 判定：兼容 WebUI 存成字符串的 "true"/"false"/"1"/"0"。"""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on", "是", "开")
+    return bool(value)
 
 
 class AgentMailPlugin(Star):
@@ -139,7 +165,7 @@ class AgentMailPlugin(Star):
 
         seen = await self.get_kv_data(SEEN_KEY, []) or []
         seen = [str(x) for x in seen]
-        stats = {"new": 0, "pushed": 0, "baseline": 0}
+        stats = {"new": 0, "pushed": 0, "baseline": 0, "files": 0, "degraded": 0}
 
         if not seen and not self.conf.get("notify_on_first_poll"):
             ids = [str(m.get("message_id")) for m in incoming if m.get("message_id")]
@@ -154,13 +180,28 @@ class AgentMailPlugin(Star):
             return stats
 
         for m in fresh:
-            text = self._compose_notice(m)
+            text, files = await self._compose_push(m)
+            chain = MessageChain([Comp.Plain(text), *files])
+            stats["files"] += len(files)
             for s in sessions:
                 try:
+                    await self.context.send_message(s, chain)
+                    stats["pushed"] += 1
+                    continue
+                except Exception as e:  # noqa: BLE001 单个会话失败不影响其它
+                    if not files:  # 纯文字都发不出去，就是会话不可达
+                        logger.warning(f"[agentmail] 推送到 {s} 失败：{e}")
+                        continue
+                    logger.warning(
+                        f"[agentmail] 带 {len(files)} 个附件推送到 {s} 失败（{e}），"
+                        "降级为纯文字清单重试"
+                    )
+                try:  # 降级：正文 + 附件清单（清单已经在 text 里）
                     await self.context.send_message(s, MessageChain([Comp.Plain(text)]))
                     stats["pushed"] += 1
-                except Exception as e:  # noqa: BLE001 单个会话失败不影响其它
-                    logger.warning(f"[agentmail] 推送到 {s} 失败：{e}")
+                    stats["degraded"] += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[agentmail] 降级后推送到 {s} 仍然失败：{e}")
 
         ids = [str(m.get("message_id")) for m in fresh if m.get("message_id")]
         await self.put_kv_data(SEEN_KEY, (ids + seen)[:SEEN_LIMIT])
@@ -179,14 +220,75 @@ class AgentMailPlugin(Star):
         return ("received" in labels) or ("unread" in labels) or not labels
 
     def _compose_notice(self, m: dict) -> str:
-        """推送文案：配了 notify_template 就按模板渲染，否则用内置文案（v0.3.0）。"""
-        return render_notice(
+        """推送文案：配了 notify_template 就按模板渲染，否则用内置文案（v0.3.0）。
+
+        v0.5.0：有附件时在末尾追加「附件清单」（文件名 + 可读大小 + 类型），
+        没有附件时输出和 v0.2.0/v0.3.0 逐字一致。
+        """
+        text = render_notice(
             m,
             template=self.conf.get("notify_template") or "",
             preview_len=self.conf.get("notify_preview_len") or 300,
             inbox=self.conf.get("inbox") or "",
             warn=logger.warning,
         )
+        block = attachment_block((m or {}).get("attachments"))
+        if block:
+            text = f"{text}\n{block}"
+        return clip_text(text, NOTICE_MAX_CHARS)
+
+    async def _compose_push(self, m: dict) -> tuple[str, list]:
+        """（v0.5.0 功能 A）返回 `(推送文案, 要一并发的附件组件列表)`。
+
+        `notify_attachments=false` → 只有文案（里面带附件清单），组件列表为空；
+        `notify_attachments=true`  → 再按 `Comp.File(name=..., url=download_url)`
+                                     逐个附加，失败只降级成清单 + warning。
+        **这个函数永远不抛异常**，正文和清单一定发得出去。
+        """
+        text = self._compose_notice(m)
+        if not _as_bool(self.conf.get("notify_attachments")):
+            return text, []
+        try:
+            files, errors = await self._attachment_components(m)
+        except Exception as e:  # noqa: BLE001 兜底：附件这条线绝不能拖垮推送
+            logger.warning(f"[agentmail] 处理附件时出错，降级为文字清单：{e}")
+            files, errors = [], [f"附件处理异常：{e}"]
+        if errors:
+            text = f"{text}\n⚠️ 附件没能一起发（正文和清单照发）：{'；'.join(errors[:3])}"
+            if len(errors) > 3:
+                text = f"{text}…（共 {len(errors)} 个附件失败）"
+        return clip_text(text, NOTICE_MAX_CHARS), files
+
+    async def _attachment_components(self, m: dict) -> tuple[list, list[str]]:
+        """（v0.5.0 功能 A）把一封邮件的附件变成 `Comp.File` 组件。
+
+        `Comp.File.file` 这个 property 会拿 `url` 自己去下载，所以**不用落临时文件**。
+        返回 `(组件列表, 失败说明列表)`；单个附件失败不影响其它附件。
+        """
+        atts = extract_attachments(m)
+        if not atts:
+            return [], []
+        mid = str((m or {}).get("message_id") or "")
+        files: list = []
+        errors: list[str] = []
+        mailer = self._mailer_or_raise()  # 和轮询共用同一个 Mailer 实例
+        for idx, att in enumerate(atts[:MAX_SEND_ATTACHMENTS], 1):
+            name = str(att.get("filename") or att.get("name") or f"附件{idx}")
+            try:
+                aid = str(att.get("attachment_id") or "")
+                if not mid or not aid:
+                    raise ValueError("缺少 message_id / attachment_id")
+                info = await asyncio.to_thread(mailer.attachment_info, mid, aid)
+                url = str((info or {}).get("download_url") or "")
+                if not url:  # 会过期的临时地址，每次现取，绝不缓存
+                    raise ValueError("接口没返回 download_url")
+                files.append(Comp.File(name=name, url=url))
+            except Exception as e:  # noqa: BLE001 单个附件失败只记 warning
+                errors.append(f"{name}：{e}")
+                logger.warning(f"[agentmail] 附件「{name}」取下载地址失败：{e}")
+        if len(atts) > MAX_SEND_ATTACHMENTS:
+            errors.append(f"附件太多，只发前 {MAX_SEND_ATTACHMENTS} 个（共 {len(atts)} 个）")
+        return files, errors
 
     # ── 指令 ────────────────────────────────────────────────
     # 不声明任何参数：AstrBot 的参数解析器会把 *args 的 annotation（inspect empty）

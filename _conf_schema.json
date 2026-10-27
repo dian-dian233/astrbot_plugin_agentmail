@@ -76,5 +76,11 @@
     "type": "bool",
     "hint": "保持关闭：首次只把现有邮件记为基线，不会刷屏",
     "default": false
+  },
+  "notify_attachments": {
+    "description": "新邮件带附件时，把附件文件一起发出去",
+    "type": "bool",
+    "hint": "关闭（默认）：只在推送文案里追加附件清单（文件名 + 大小 + 类型）。打开：清单之后再用文件组件把附件逐个发出去；取不到下载地址或平台不支持文件组件时自动降级成文字清单，只记 warning",
+    "default": false
   }
 }
