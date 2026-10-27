@@ -1,0 +1,28 @@
+# ruff 配置：CI（.github/workflows/ci.yml）和本地 `ruff check .` 共用同一套规则。
+# 本地复现 CI：pip install ruff && ruff check .
+
+# 行宽：仓库里中文注释/长 URL 较多，实测最长 164 字符，故 E501 不强制（见下方 ignore）。
+line-length = 120
+
+# 跟着 AstrBot 的 requires-python（pyproject.toml: >=3.12）走，不往下兼容 3.10 / 3.11。
+target-version = "py312"
+
+exclude = [".git", "__pycache__", ".deps", ".ruff_cache", "build", "dist"]
+
+[lint]
+# 规则集：
+#   E   pycodestyle errors      W   pycodestyle warnings   F   pyflakes
+#   I   isort（导入排序）        B   flake8-bugbear（常见坑）  C4  flake8-comprehensions
+select = ["E", "W", "F", "I", "B", "C4"]
+
+ignore = [
+    # 行宽噪音：中文标点/长 URL 下字符数没有参考价值（本仓库确有超过 120 字符的历史行）。
+    "E501",
+]
+
+[lint.per-file-ignores]
+# main.py 是插件运行逻辑，本次只加 CI、约定「一行都不动」，所以给它的两处历史问题开豁免：
+#   I001 —— try / except 两个 import 块里的顺序不符合 isort 默认排序；
+#   F401 —— DIGEST_LATEST 在两个分支里镜像导入，实际未使用（v0.5.0 遗留）。
+# 以后单独提 PR 清理 main.py 时，顺手把这段豁免删掉即可。
+"main.py" = ["I001", "F401"]
