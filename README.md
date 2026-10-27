@@ -44,6 +44,9 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 | `notify_template` | 推送文案模板，**留空=内置文案**。可用占位符 `{subject}` `{from}` `{preview}` `{time}` `{inbox}`；写错（未知占位符、花括号没闭合）会自动回退内置文案并记 warning，不会报错 |
 | `notify_on_first_poll` | 首次轮询是否推送历史邮件，建议保持关（首次只记基线，不刷屏） |
 | `notify_attachments` | 推送时是否**把附件文件一起发出去**，默认关。关着也会显示附件清单（名字+大小+类型），只是不发真文件 |
+| `digest_enabled` | 是否开启每日未读摘要，默认关 |
+| `digest_time` | 摘要时间，24 小时制**本地时间**，默认 `09:00`；写错回退 `09:00` + warning，不报错 |
+| `digest_sessions` | 摘要推到哪些会话，**留空则用 `notify_sessions`** |
 
 > ⚠️ 建议保持 `allow_all=false`：邮箱是你的，别人能用了就能以你的名义发信。群聊要用就填 `allowed_groups`。
 
@@ -57,6 +60,7 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 /mail whoami
 /mail here            # 打印当前会话 ID，填收信推送用
 /mail poll            # 手动跑一次收信轮询
+/mail digest          # 立刻推一次未读摘要（v0.4.0）
 ```
 
 ## 收信推送（v0.2.0）
@@ -135,6 +139,33 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 - 走 AgentMail 的 `GET /v0/inboxes/{inbox}/messages/search?q=...&limit=1-100`（`q` 必填、`limit` 上限 100、结果是相关度排序所以插件自己重排成时间倒序）
 - 万一这个接口不可用（老部署没这路由 / 参数被拒），会自动**降级成「在最近 N 封里本地过滤」**，并在回复里注明降级了
 
+## 每日未读摘要（v0.4.0）
+
+不想天天翻邮箱，就让插件每天到点给你发一条：
+
+```
+📬 每日未读摘要 · 2026-10-27
+收件箱：diandian233@agentmail.to
+未读邮件：2 封
+────────────
+最新 2 封：
+1. 10-27 10:24 · 点点 <diandian233@agentmail.to> · 附件接口验证 v0.4
+2. 10-27 08:45 · AgentMail Admin <admin@agentmail.to> · Welcome to AgentMail, your inbox is ready
+```
+
+开法：`digest_enabled` 打开，`digest_time` 填时间（默认 `09:00`），`digest_sessions` 填会话 ID
+（**留空就用 `notify_sessions`**）。想立刻看效果不用等到点，发 `/mail digest` 手动推一次。
+
+细节（都是踩过坑才写对的）：
+
+- **定时器在插件里**，不需要外部 cron；每 30 秒看一眼表，到点才干活
+- **跨天判断用本地时间**（`datetime.now()`），不用 UTC，避免东八区差 8 小时搞出「一天两次」或「整天不推」
+- **同一天只推一次**：推完把日期写进插件 KV，进程重启后也不会重复推当天那份
+- 没到点不推；当天插件是夜里才启动的，会补推一次当天摘要（因为你确实还没收到今天的摘要）
+- `digest_time` 写错（`9点`、`25:00`、`9:70`）→ 回退 `09:00` 并记 warning，**不抛异常**
+- 摘要和收信轮询**共用同一个 `Mailer` 实例**，不会开两条连接狂刷接口
+- 未读数是拿「最近 50 封未读」统计的，到了 50 会显示 `50+ 封`，不编造精确数字
+
 ## 附件随推送（v0.4.0）
 
 新邮件带附件时，推送里会多一段清单（`notify_attachments` 关着也照样有）：
@@ -201,9 +232,24 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 ## 原理备忘
 
 ```
-/mail send ...  →  Mailer.send()  →  POST /v0/inboxes/{inbox}/messages/send
-                                     Authorization: Bearer <api_key>
+/mail send ...     →  Mailer.send()      →  POST /v0/inboxes/{inbox}/messages/send
+/mail search ...   →  Mailer.search()    →  GET  /v0/inboxes/{inbox}/messages/search?q=&limit=
+/mail list/read    →  Mailer.list/read() →  GET  /v0/inboxes/{inbox}/messages[...]
+附件真文件         →  Mailer.attachment_info() → download_url（签名 CDN）→ 直连下载
+                                         Authorization: Bearer <api_key>（签名 URL 除外）
 ```
+
+模块分工（方便改代码的人）：
+
+| 文件 | 干什么 |
+| --- | --- |
+| `main.py` | 插件本体：指令、收信轮询、附件推送、摘要调度 |
+| `mailer.py` | 只跟 HTTP 打交道（纯标准库，直连/代理自动回退） |
+| `notify.py` | v0.3.0 推送模板渲染 + v0.4.0 附件清单拼接（纯函数） |
+| `attach.py` | 附件清单格式化 + 下载编排（临时目录、大小上限、失败降级） |
+| `search.py` | `/mail search` 的参数解析、时间倒序、本地降级过滤、输出排版 |
+| `digest.py` | 每日摘要的时间解析、到点判断、文案排版 |
+| `selftest.py` | 离线自测（假 astrbot 桩 + 假 mailer，`--offline` 不连真 API） |
 
 接口文档：<https://docs.agentmail.to>（OpenAPI：<https://docs.agentmail.to/openapi.json>，注意路径是 `/v0`）
 

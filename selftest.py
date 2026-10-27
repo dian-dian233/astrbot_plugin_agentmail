@@ -6,6 +6,8 @@
         下载失败降级 / 适配器不支持文件降级 / 临时目录清理
       + v0.4.0 /mail search：参数解析 / 时间倒序 / 空关键词用法 / 无结果文案 /
         接口不支持降级本地过滤
+      + v0.4.0 每日未读摘要：时间解析回退 / 到点推一次 / 同一天不重复 /
+        重启不重复 / 跨天再推 / 会话回落 / Mailer 复用
 
 用法：
     PYTHONDONTWRITEBYTECODE=1 python3 selftest.py            # 含真实 API 抽查（没网/没 key 会自动跳过）
@@ -17,6 +19,7 @@ import os
 import sys
 import tempfile
 import types
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OFFLINE = "--offline" in sys.argv
@@ -111,6 +114,11 @@ try:
         human_size,
         safe_filename,
     )
+    from astrbot_plugin_agentmail.digest import (  # noqa: E402
+        format_digest,
+        is_due as digest_is_due,
+        parse_time as parse_digest_time,
+    )
     from astrbot_plugin_agentmail.mailer import MailError  # noqa: E402
     from astrbot_plugin_agentmail.main import AgentMailPlugin  # noqa: E402
     from astrbot_plugin_agentmail.notify import render_notice  # noqa: E402
@@ -128,6 +136,11 @@ except ImportError:  # 仓库根目录直接跑
         download_attachments,
         human_size,
         safe_filename,
+    )
+    from digest import (  # noqa: E402
+        format_digest,
+        is_due as digest_is_due,
+        parse_time as parse_digest_time,
     )
     from mailer import MailError  # noqa: E402
     from main import AgentMailPlugin  # noqa: E402
@@ -228,6 +241,26 @@ class FakeSearchMailer(FakeMailer):
         data = self.messages if self.hits is None else self.hits
         order = [2, 0, 1] if len(data) >= 3 else list(range(len(data)))
         return [data[i] for i in order][:limit]
+
+
+class FakeUnreadMailer(FakeMailer):
+    """假 mailer：支持按 labels 过滤（模拟接口的 labels=unread），并记录调用。"""
+
+    def __init__(self, messages):
+        super().__init__(messages)
+        self.list_calls = []
+
+    def list(self, limit=5, labels=None):
+        self.list_calls.append((limit, tuple(labels or ())))
+        msgs = list(self.messages)
+        if labels:
+            want = {str(x).lower() for x in labels}
+            msgs = [
+                m
+                for m in msgs
+                if want <= {str(x).lower() for x in (m.get("labels") or [])}
+            ]
+        return msgs[:limit]
 
 
 class RecordingContext(FakeContext):
@@ -422,8 +455,139 @@ def test_notify_template():
     print("④ _compose_notice 走配置：自定义模板 / 空配置 / 非法模板（回退+warning）三种都对 ✅")
 
 
-def s_mail(mid, subject, ts, frm="boss@corp.com", preview="正文预览"):
-    m = mail(mid, subject, frm=frm, preview=preview)
+def test_digest_helpers():
+    """v0.4.0 功能③：时间解析 / 到点判断 / 摘要文案（纯函数）。"""
+    print("\n── 每日未读摘要（v0.4.0 纯函数）──")
+
+    # 时间解析
+    assert parse_digest_time("09:00") == (9, 0)
+    assert parse_digest_time("9:5") == (9, 5)
+    assert parse_digest_time(" 21：30 ") == (21, 30), "全角冒号也要认"
+    assert parse_digest_time("") == (9, 0) and parse_digest_time(None) == (9, 0)
+    WARNINGS.clear()
+    for bad in ("9点", "25:00", "9:70", "abc", "09:00:00", 123, "-1:00"):
+        assert parse_digest_time(bad, warn=_warn) == (9, 0), f"{bad!r} 应该回退 09:00"
+    assert len(WARNINGS) == 7 and all("digest_time" in w for w in WARNINGS), WARNINGS
+    print("   ① 时间解析：09:00 / 9:5 / 全角 / 空 → 正常；7 种写错 → 回退 09:00 + warning，零异常 ✅")
+
+    # 到点判断（含跨天 / 同一天不重复 / 本地时区语义）
+    now = datetime(2026, 10, 27, 9, 0, 30)
+    assert digest_is_due(now, 9, 0, "") is True
+    assert digest_is_due(now, 9, 0, "2026-10-27") is False, "同一天不能推第二次"
+    assert digest_is_due(datetime(2026, 10, 27, 8, 59), 9, 0, "") is False, "没到点不能推"
+    assert digest_is_due(datetime(2026, 10, 28, 9, 0), 9, 0, "2026-10-27") is True, "跨天要能推"
+    assert digest_is_due(datetime(2026, 10, 28, 0, 5), 9, 0, "2026-10-27") is False, "第二天凌晨没到点"
+    # 本地时区语义：东八区 09:05 就是「到点」，不能因为 UTC 还在 01:05 就判成没到点
+    cst = timezone(timedelta(hours=8))
+    assert digest_is_due(datetime(2026, 10, 27, 9, 5, tzinfo=cst), 9, 0, "") is True
+    print("   ② 到点判断：到点推 / 同一天不重复 / 跨天才再推 / 凌晨不误推 / 东八区 09:05 算到点 ✅")
+
+    # 文案
+    msgs = [
+        s_mail("d-1", "最早的", "2026-10-01T00:00:00.000Z"),
+        s_mail("d-2", "最新的", "2026-10-27T02:24:08.000Z"),
+        s_mail("d-3", "中间的", "2026-10-15T01:00:00.000Z"),
+        s_mail("d-4", "更早的", "2026-09-30T00:00:00.000Z"),
+    ]
+    text = format_digest(4, msgs, inbox="me@agentmail.to", now=datetime(2026, 10, 27, 9, 0), tz=timezone.utc)
+    assert "📬 每日未读摘要 · 2026-10-27" in text, text
+    assert "未读邮件：4 封" in text and "收件箱：me@agentmail.to" in text, text
+    assert "最新 3 封" in text, "最多只列 3 封"
+    assert "1. 10-27 02:24 · boss@corp.com · 最新的" in text, text
+    tail = text.split("最新 3 封")[1]
+    assert "中间的" in tail and "最早的" in tail and "更早的" not in tail, "只列最新 3 封，第 4 封不该出现"
+    assert "0 封" in format_digest(0, [], now=datetime(2026, 10, 27, 9, 0)), "0 未读要有单独文案"
+    assert "50+ 封" in format_digest(50, msgs, now=datetime(2026, 10, 27, 9, 0)), "到上限标 50+"
+    print("   ③ 文案：日期 / 未读封数 / 最新 3 封（时间 · 发件人 · 主题）/ 0 封单独文案 ✅")
+
+
+async def test_digest_schedule():
+    """v0.4.0 功能③：调度行为（到点推一次 / 同一天不重复 / 重启不重复 / 格式错回退）。"""
+    print("\n── 每日未读摘要调度（v0.4.0 集成）──")
+    inbox_msgs = [
+        s_mail("u-1", "未读甲", "2026-10-27T02:00:00.000Z"),
+        s_mail("u-2", "未读乙", "2026-10-27T01:00:00.000Z"),
+        s_mail("r-1", "已读的", "2026-10-27T00:30:00.000Z", labels=("received",)),
+    ]
+
+    # ④ 默认关闭：不会起调度
+    p_off = AgentMailPlugin(FakeContext(), conf())
+    p_off._start_digest()
+    assert p_off._digest_task is None, "digest_enabled 默认关，不该起后台任务"
+
+    # ⑤ 到点推一次
+    ctx = RecordingContext()
+    p = AgentMailPlugin(ctx, conf(digest_enabled=True, digest_time="09:00", digest_sessions=["sess-a"]))
+    p._mailer = FakeUnreadMailer(inbox_msgs)
+    st = await p._maybe_digest(datetime(2026, 10, 27, 9, 0, 5))
+    assert st and st["pushed"] == 1 and st["unread"] == 2, st
+    assert len(ctx.sent) == 1 and ctx.sent[0][0] == "sess-a", ctx.sent
+    body = ctx.sent[0][1].components[0].text
+    assert "每日未读摘要" in body and "未读邮件：2 封" in body and "未读甲" in body, body
+    assert "已读的" not in body, "已读邮件不该进摘要"
+    assert p._mailer.list_calls[-1] == (50, ("unread",)), p._mailer.list_calls
+    assert await p.get_kv_data("digest_last_date", "") == "2026-10-27"
+    print("   ④ 到点推一次：未读 2 封 + 最新 2 封进文案，只请求 labels=unread，日期已记 KV ✅")
+
+    # ⑥ 同一天不重复
+    assert await p._maybe_digest(datetime(2026, 10, 27, 9, 30)) is None
+    assert await p._maybe_digest(datetime(2026, 10, 27, 18, 0)) is None
+    assert len(ctx.sent) == 1, "同一天只能推一次"
+    print("   ⑤ 同一天（9:30 / 18:00）再检查 → 一条都不多推 ✅")
+
+    # ⑦ 进程重启后不重复推当天（KV 是持久化的，这里用同一份 KV 模拟重启）
+    ctx_r = RecordingContext()
+    p_restart = AgentMailPlugin(ctx_r, conf(digest_enabled=True, digest_time="09:00", digest_sessions=["sess-a"]))
+    p_restart._mailer = FakeUnreadMailer(inbox_msgs)
+    p_restart._kv = dict(p._kv)  # 继承「今天已经推过」的 KV
+    assert await p_restart._maybe_digest(datetime(2026, 10, 27, 10, 0)) is None
+    assert ctx_r.sent == [], "重启后不能重复推当天的摘要"
+    print("   ⑥ 模拟进程重启（KV 继承）→ 当天不再重复推 ✅")
+
+    # ⑧ 跨天到点再推
+    assert await p._maybe_digest(datetime(2026, 10, 28, 9, 1)) is not None
+    assert len(ctx.sent) == 2, "第二天到点要再推一次"
+    assert await p.get_kv_data("digest_last_date", "") == "2026-10-28"
+    print("   ⑦ 跨天（次日 09:01）→ 再推一次，日期改成 10-28 ✅")
+
+    # ⑨ 时间格式写错 → 回退 09:00 + warning，照样能推，不抛异常
+    WARNINGS.clear()
+    ctx_bad = RecordingContext()
+    p_bad = AgentMailPlugin(ctx_bad, conf(digest_enabled=True, digest_time="9点上班", digest_sessions=["sess-b"]))
+    p_bad._mailer = FakeUnreadMailer(inbox_msgs)
+    assert p_bad._digest_clock() == (9, 0)
+    assert any("digest_time" in w for w in WARNINGS), WARNINGS
+    assert await p_bad._maybe_digest(datetime(2026, 10, 27, 8, 59)) is None, "回退成 09:00，8:59 不该推"
+    assert (await p_bad._maybe_digest(datetime(2026, 10, 27, 9, 0)))["pushed"] == 1
+    print("   ⑧ digest_time 写错 → 回退 09:00 + warning，8:59 不推、9:00 推，零异常 ✅")
+
+    # ⑩ digest_sessions 留空 → 用 notify_sessions；两者都空 → 不起任务、只 warning
+    p_fb = AgentMailPlugin(FakeContext(), conf(digest_enabled=True, digest_sessions=[]))
+    assert p_fb._digest_sessions() == ["aiocqhttp:FriendMessage:1150880493"], "留空要回落到 notify_sessions"
+    WARNINGS.clear()
+    p_none = AgentMailPlugin(FakeContext(), conf(digest_enabled=True, digest_sessions=[], notify_sessions=[]))
+    p_none._start_digest()
+    assert p_none._digest_task is None and any("digest_sessions" in w for w in WARNINGS), WARNINGS
+    # 共用同一个 Mailer 实例（别开两条连接）
+    p_shared = AgentMailPlugin(FakeContext(), conf(digest_enabled=True))
+    fake = FakeUnreadMailer(inbox_msgs)
+    p_shared._mailer = fake
+    assert p_shared._mailer_or_raise() is fake
+    await p_shared._collect_unread()
+    assert p_shared._mailer is fake and fake.list_calls, "摘要必须复用收信轮询的 Mailer 实例"
+    print("   ⑨ digest_sessions 留空 → 回落 notify_sessions；都空 → 只 warning 不起任务；Mailer 实例复用 ✅")
+
+    # ⑪ 手动 /mail digest：能立刻推，但不写「今天已推过」的标记
+    p_manual = AgentMailPlugin(FakeContext(), conf(digest_enabled=True, digest_sessions=["sess-m"]))
+    p_manual._mailer = FakeUnreadMailer(inbox_msgs)
+    out = await collect(p_manual.mail, FakeEvent("/mail digest"))
+    assert any("摘要已推到 1 个会话" in r for r in out), out
+    assert await p_manual.get_kv_data("digest_last_date", "") == "", "手动触发不写日期标记"
+    print("   ⑩ /mail digest 手动触发：立刻推一次，且不占用当天的定时名额 ✅")
+
+
+def s_mail(mid, subject, ts, frm="boss@corp.com", preview="正文预览", labels=("received", "unread")):
+    m = mail(mid, subject, labels=labels, frm=frm, preview=preview)
     m["timestamp"] = ts
     return m
 
@@ -663,6 +827,20 @@ async def test_attachment_push():
     assert "已降级为文字清单" in ctx5.sent[-1][1].components[0].text
     print("   ⑧ 适配器不支持文件消息 → 自动降级纯文字（degraded=1），不抛不重试 ✅")
 
+    # ⑧b 老版本 AstrBot 没有 File 组件 → 也降级纯文字，不抛
+    ctx6 = RecordingContext()
+    p6 = AgentMailPlugin(ctx6, conf(notify_on_first_poll=True, notify_attachments=True))
+    p6._mailer = FakeAttachMailer([mail("m6", "没有 File 组件", attachments=[att()])])
+    saved_file = comp_mod.File
+    comp_mod.File = None
+    try:
+        st6 = await p6._poll_once()
+    finally:
+        comp_mod.File = saved_file
+    assert st6["pushed"] == 1 and st6["files"] == 0, st6
+    assert "已降级为文字清单" in ctx6.sent[-1][1].components[0].text
+    print("   ⑧b 老版本 AstrBot 没 File 组件 → 同样降级纯文字，不抛异常 ✅")
+
     # ⑨ 兜底：整轮没有残留临时目录
     leftovers = set(glob.glob(os.path.join(tempfile.gettempdir(), "agentmail-*"))) - base_dirs
     assert not leftovers, f"临时目录没清干净：{leftovers}"
@@ -728,6 +906,10 @@ async def main():
     # ── v0.4.0 /mail search ──
     test_search_helpers()
     await test_search_command()
+
+    # ── v0.4.0 每日未读摘要 ──
+    test_digest_helpers()
+    await test_digest_schedule()
 
     print("\n全部断言通过 ✅")
 

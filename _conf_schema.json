@@ -77,6 +77,24 @@
     "hint": "保持关闭：首次只把现有邮件记为基线，不会刷屏",
     "default": false
   },
+  "digest_enabled": {
+    "description": "开启每日未读摘要",
+    "type": "bool",
+    "hint": "默认关闭。打开后插件每天到点自己统计未读邮件数 + 最新 3 封，推到目标会话（插件自带定时，不需要外部 cron）",
+    "default": false
+  },
+  "digest_time": {
+    "description": "每日摘要时间（24 小时制，本地时间）",
+    "type": "string",
+    "hint": "默认 09:00，格式 HH:MM，例如 09:00 / 21:30。写错会自动回退 09:00 并记 warning，不会报错",
+    "default": "09:00"
+  },
+  "digest_sessions": {
+    "description": "每日摘要推到哪些会话",
+    "type": "list",
+    "hint": "留空则用 notify_sessions。填法同 notify_sessions（/mail here 拿 ID），一行一个",
+    "default": []
+  },
   "notify_attachments": {
     "description": "推送时尝试把附件文件一起发出去",
     "type": "bool",
