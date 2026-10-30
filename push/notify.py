@@ -11,20 +11,20 @@ v0.3.0 新增配置 `notify_template`：
 约定：
 1. 模板为空（或全是空白）→ 用 v0.2.0 的内置文案，行为完全不变。
 2. 模板非法（未知占位符 `{foo}`、花括号没闭合 `{subject`、格式控制等）
-   → **不抛异常**，回退内置文案，并通过 warn 回调（默认标准库 logging）
+   → **不抛异常**，回退内置文案，并通过 warn 回调（默认静默，运行期注入 astrbot logger）
    记一条 warning。
 """
 
 from __future__ import annotations
 
-import logging
 import string
+
+from ..core.logs import SILENT
 
 DEFAULT_PREVIEW_LEN = 300
 PLACEHOLDERS = ("subject", "from", "preview", "time", "inbox")
 _ALLOWED = frozenset(PLACEHOLDERS)
 
-logger = logging.getLogger("astrbot_plugin_agentmail")
 
 
 class TemplateError(ValueError):
@@ -114,7 +114,7 @@ def render_notice(
 ) -> str:
     """渲染推送文案。模板空/非法都回退内置文案，且永远不抛异常。"""
     fallback = builtin_notice(message, preview_len)
-    emit = warn or logger.warning
+    emit = warn or SILENT.warning
 
     if template is None:
         return fallback

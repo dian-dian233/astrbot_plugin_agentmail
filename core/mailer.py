@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 import urllib.error
 import urllib.parse
@@ -32,8 +31,8 @@ from ..tools.search import (
     filter_messages,
     normalize_limit,
 )
+from .logs import SILENT
 
-logger = logging.getLogger("astrbot_plugin_agentmail")
 # 服务端搜索端点"不可用"的状态码：这些情况退化成本地过滤，其它错误（401 等）照常抛
 SEARCH_FALLBACK_STATUS = (400, 404, 405, 422, 501)
 SEARCH_FALLBACK_SCAN = 50
@@ -83,6 +82,7 @@ class Mailer:
         proxy: str = "",
         base: str = DEFAULT_BASE,
         timeout: int = 30,
+        logger=None,
     ):
         if not api_key:
             raise MailError("没有配置 AgentMail API Key")
@@ -91,6 +91,8 @@ class Mailer:
         self.proxy = (proxy or "").strip()
         self.base = (base or DEFAULT_BASE).rstrip("/")
         self.timeout = int(timeout or 30)
+        # 运行期由 main.py 注入 astrbot 的 logger；单测不传就静默
+        self._log = logger or SILENT
 
     # ── 底层 ────────────────────────────────────────────────
     def _raw(self, path: str, method: str, body: dict | None, use_proxy: bool):
@@ -188,7 +190,7 @@ class Mailer:
         except MailError as e:
             if not (cc_list or bcc_list) or not cc_fallback or not _cc_unsupported(e):
                 raise
-            logger.warning(f"[agentmail] 服务端不认 cc/bcc 字段（{e}），改为把 CC/BCC 写进正文重发")
+            self._log.warning(f"[agentmail] 服务端不认 cc/bcc 字段（{e}），改为把 CC/BCC 写进正文重发")
             payload.pop("cc", None)
             payload.pop("bcc", None)
             header = []
@@ -222,7 +224,7 @@ class Mailer:
         except MailError as e:
             if e.status not in SEARCH_FALLBACK_STATUS:
                 raise
-            logger.warning(
+            self._log.warning(
                 f"[agentmail] 服务端搜索不可用（HTTP {e.status}），退化为 list({SEARCH_FALLBACK_SCAN}) 本地过滤"
             )
             return self._search_locally(kw, n)

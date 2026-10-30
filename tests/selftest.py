@@ -387,24 +387,25 @@ def test_notify_template():
         assert WARNINGS and "推送模板不可用" in WARNINGS[-1], f"非法模板 {tpl!r} 没记 warning"
         print(f"   非法模板 {tpl!r} → 回退内置文案 + warning ✅")
 
-    # ③″ 不给 warn 回调时，走标准库 logging 也要留痕（插件里传的是 astrbot logger）
-    import logging
+    # ③″ 不给 warn 回调时：走 SILENT 兜底（静默、不抛、不依赖标准库日志模块）
+    #     上架规则禁止各模块自建日志器，运行期由 main.py 注入 astrbot 的 logger
+    assert render_notice(m, template="{foo}") == baseline, "无 warn 时应静默回退，不许抛"
+    print("   无 warn 回调 → SILENT 静默兜底，不抛异常 ✅")
 
-    recs = []
+    # ③‴ 静态检查：源码里不许出现标准库日志模块（上架硬规定）
+    import pathlib as _pl
 
-    class _Cap(logging.Handler):
-        def emit(self, record):
-            recs.append(record.getMessage())
-
-    lg = logging.getLogger("astrbot_plugin_agentmail")
-    h = _Cap()
-    lg.addHandler(h)
-    try:
-        assert render_notice(m, template="{foo}") == baseline
-    finally:
-        lg.removeHandler(h)
-    assert recs and "推送模板不可用" in recs[-1], recs
-    print("   默认 warn 通道（标准库 logging）也留了 warning ✅")
+    _root = _pl.Path(__file__).resolve().parent.parent
+    _bad = []
+    for _f in _root.rglob("*.py"):
+        if ".git" in _f.parts or "tests" in _f.parts:
+            continue
+        for _i, _line in enumerate(_f.read_text(encoding="utf-8").splitlines(), 1):
+            _code = _line.split("#", 1)[0]
+            if ("import " + "logging") in _code or ("logging" + ".getLogger") in _code:
+                _bad.append(f"{_f.relative_to(_root)}:{_i}")
+    assert not _bad, f"源码里出现标准库日志模块（应用 astrbot.api.logger 或注入）：{_bad}"
+    print("   静态检查：源码零标准库日志模块引用 ✅")
 
     # ③′ 非字符串配置也不炸
     for weird in (None, 123, ["{subject}"]):
