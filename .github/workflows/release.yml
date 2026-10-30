@@ -98,8 +98,14 @@ jobs:
             [ -e "$f" ] && cp "$f" "$stage/" || true
           done
 
+          # 运行期子包必须整目录带上，否则装上就起不来
+          for d in core push tools; do
+            [ -d "$d" ] && cp -R "$d" "$stage/" || true
+          done
+
           # 排除测试文件、缓存、VCS 元数据、CI 自身
           rm -f "$stage/selftest.py"
+          rm -rf "$stage/tests"
           find stage -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
           find stage -name '*.pyc' -delete 2>/dev/null || true
           find stage -name '.git*' -prune -exec rm -rf {} + 2>/dev/null || true
