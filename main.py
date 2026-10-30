@@ -187,6 +187,8 @@ class AgentMailPlugin(Star):
                 inbox=self.conf.get("inbox", ""),
                 proxy=self.conf.get("proxy", ""),
                 timeout=int(self.conf.get("timeout", 30) or 30),
+                # 上架规则：logger 只能来自 astrbot.api，这里注入给 Mailer 用
+                logger=logger,
             )
         return self._mailer
 

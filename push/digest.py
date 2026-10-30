@@ -15,6 +15,8 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 
+from ..core.logs import SILENT
+
 DEFAULT_DIGEST_TIME = "09:00"
 DEFAULT_HOUR = 9
 DEFAULT_MINUTE = 0
@@ -30,9 +32,7 @@ def _emit(warn, message: str) -> None:
     if warn:
         warn(message)
         return
-    import logging
-
-    logging.getLogger("astrbot_plugin_agentmail").warning(message)
+    SILENT.warning(message)
 
 
 def parse_time(raw, warn=None) -> tuple[int, int]:
