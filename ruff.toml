@@ -21,8 +21,8 @@ ignore = [
 ]
 
 [lint.per-file-ignores]
-# main.py 是插件运行逻辑，本次只加 CI、约定「一行都不动」，所以给它的两处历史问题开豁免：
-#   I001 —— try / except 两个 import 块里的顺序不符合 isort 默认排序；
-#   F401 —— DIGEST_LATEST 在两个分支里镜像导入，实际未使用（v0.5.0 遗留）。
-# 以后单独提 PR 清理 main.py 时，顺手把这段豁免删掉即可。
-"main.py" = ["I001", "F401"]
+# 只剩一处历史豁免：
+#   F401 —— main.py 从 push/digest.py 导入了 DIGEST_LATEST，实际没用到（v0.5.0 遗留）。
+# 重构前还有一条 I001（try / except 两个镜像 import 块的顺序），v0.6 目录重构把平铺兜底
+# 删掉、导入块按 isort 重排后就没了，豁免一起删掉。
+"main.py" = ["F401"]

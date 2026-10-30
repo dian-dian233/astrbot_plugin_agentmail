@@ -56,68 +56,40 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 
-try:  # 插件包内导入
-    from .attach import (
-        MAX_SEND_ATTACHMENTS,
-        NOTICE_MAX_CHARS,
-        attachment_block,
-        clip_text,
-        extract_attachments,
-    )
-    from .audit import AuditLog, db_path, format_log_rows, resolve_data_dir
-    from .digest import (
-        DIGEST_FETCH,
-        DIGEST_LATEST,
-        fmt_clock,
-        format_digest,
-        is_due,
-        next_check_delay,
-        parse_time,
-    )
-    from .limits import (
-        after_success,
-        check_send_limit,
-        format_limit_message,
-        format_quota_note,
-        read_cooldown,
-        read_daily_limit,
-    )
-    from .mailer import MailError, Mailer
-    from .notify import render_notice
-    from .perm import evaluate as evaluate_permission
-    from .search import format_rows, parse_search_args
-    from .sendargs import SendArgs, SendArgsError, parse_send_args
-except ImportError:  # 单独运行 / 被平铺加载时
-    from attach import (  # type: ignore[no-redef]
-        MAX_SEND_ATTACHMENTS,
-        NOTICE_MAX_CHARS,
-        attachment_block,
-        clip_text,
-        extract_attachments,
-    )
-    from audit import AuditLog, db_path, format_log_rows, resolve_data_dir  # type: ignore[no-redef]
-    from digest import (  # type: ignore[no-redef]
-        DIGEST_FETCH,
-        DIGEST_LATEST,
-        fmt_clock,
-        format_digest,
-        is_due,
-        next_check_delay,
-        parse_time,
-    )
-    from limits import (  # type: ignore[no-redef]
-        after_success,
-        check_send_limit,
-        format_limit_message,
-        format_quota_note,
-        read_cooldown,
-        read_daily_limit,
-    )
-    from mailer import MailError, Mailer  # type: ignore[no-redef]
-    from notify import render_notice  # type: ignore[no-redef]
-    from perm import evaluate as evaluate_permission  # type: ignore[no-redef]
-    from search import format_rows, parse_search_args  # type: ignore[no-redef]
-    from sendargs import SendArgs, SendArgsError, parse_send_args  # type: ignore[no-redef]
+# 导入一律走相对导入：AstrBot 的 star_manager 用 __import__("data.plugins.<目录名>.main",
+# fromlist=["main"]) 按「包」加载插件，所以本文件属于 astrbot_plugin_agentmail 这个包，
+# core/ push/ tools/ 三个子包也能用相对导入（子包各自带 __init__.py）。
+# v0.6.x 目录重构：原来的 try/except 平铺兜底（from attach import ...）已无意义，删掉。
+from .core.audit import AuditLog, db_path, format_log_rows, resolve_data_dir
+from .core.limits import (
+    after_success,
+    check_send_limit,
+    format_limit_message,
+    format_quota_note,
+    read_cooldown,
+    read_daily_limit,
+)
+from .core.mailer import Mailer, MailError
+from .core.perm import evaluate as evaluate_permission
+from .core.sendargs import SendArgs, SendArgsError, parse_send_args
+from .push.attach import (
+    MAX_SEND_ATTACHMENTS,
+    NOTICE_MAX_CHARS,
+    attachment_block,
+    clip_text,
+    extract_attachments,
+)
+from .push.digest import (
+    DIGEST_FETCH,
+    DIGEST_LATEST,
+    fmt_clock,
+    format_digest,
+    is_due,
+    next_check_delay,
+    parse_time,
+)
+from .push.notify import render_notice
+from .tools.search import format_rows, parse_search_args
 
 HELP = """AgentMail 邮件工具
 · /mail send <收件人> [--cc 抄送] [--bcc 密送] <主题> | <正文>
