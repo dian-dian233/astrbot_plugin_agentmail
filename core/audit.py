@@ -43,7 +43,9 @@ from datetime import datetime
 PLUGIN_NAME = "astrbot_plugin_agentmail"
 DB_NAME = "mail_audit.sqlite3"
 
-_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+# 插件根目录（本文件在 core/ 下，故往上两级）。语义与重构前完全一致：
+# 用来保证审计库永不落进插件仓库目录，以及反推 <root>/data。
+_PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mail_audit (

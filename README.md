@@ -7,6 +7,42 @@
 
 底层是 [AgentMail](https://agentmail.to)（给 AI agent 用的邮件服务），不依赖沙盒、不依赖 bootstrap，装满配好就能用。
 
+## 目录结构
+
+根目录只放「框架要认的东西 + 入口 + 项目文件」，剩下按职责分三个子包（v0.6.x 重构，
+纯搬家、行为一行没改）：
+
+```text
+astrbot_plugin_agentmail/
+├── main.py            # 插件入口：只留 Star 子类、指令/LLM 工具注册与调度
+├── __init__.py        # 空文件，AstrBot 以「包」的方式加载插件目录时需要它
+├── metadata.yaml      # 插件元数据（框架约定，必须在根目录）
+├── _conf_schema.json  # WebUI 配置 schema（框架约定，必须在根目录）
+├── requirements.txt   # 空（纯标准库实现）
+├── core/              # 收发与策略
+│   ├── mailer.py      #   AgentMail HTTP 客户端（直连 + 代理双通道、搜索降级）
+│   ├── perm.py        #   权限判定（放行/拒绝 + 原因码 + 解决建议）
+│   ├── limits.py      #   发送限流（冷却 / 每日额度）
+│   ├── audit.py       #   发件审计（sqlite3 落库、`/mail log` 取数）
+│   └── sendargs.py    #   `/mail send` 参数解析（--cc / --bcc）
+├── push/              # 收信推送
+│   ├── notify.py      #   推送文案模板渲染
+│   ├── digest.py      #   每日未读摘要（定时、去重、文案）
+│   └── attach.py      #   附件清单 / 文件组件
+├── tools/             # 检索
+│   └── search.py      #   历史邮件搜索（服务端 q/limit + 本地兜底 + 结果排版）
+├── tests/
+│   └── selftest.py    # 离线自测（桩掉 astrbot.api，360 条断言）
+└── docs/screenshots/  # 截图（占位）
+```
+
+跨文件 import 一律用**相对导入**（`from .core.mailer import Mailer`）：
+AstrBot 的 `star_manager` 是按包加载的——`path = "data.plugins.<插件目录名>.main"` 然后
+`__import__(path, fromlist=["main"])`（v4.9.0 / v4.20.0 / v4.29.3 都是这一行），
+所以插件目录就是个真包，`main.py` 里的 `__package__` 是 `data.plugins.astrbot_plugin_agentmail`，
+子包 `core/` `push/` `tools/`（各自带 `__init__.py`）能正常被相对导入。
+`main.py` / `metadata.yaml` / `_conf_schema.json` 必须留在根目录，这是框架约定。
+
 ## 安装
 
 **方式一：WebUI 装（推荐）**
@@ -228,7 +264,7 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 
 只有当这个端点回 **400 / 404 / 405 / 422 / 501**（比如套餐或权限不支持）时，
 才自动退化为 **本地过滤**：`GET /v0/inboxes/{inbox}/messages?limit=50` 拉最近 50 封，
-再用 `search.py` 里的纯函数做大小写不敏感的 `in` 匹配（主题 / 发件人 / 正文预览 / text），
+再用 `tools/search.py` 里的纯函数做大小写不敏感的 `in` 匹配（主题 / 发件人 / 正文预览 / text），
 日志里会留一条 `服务端搜索不可用（HTTP xxx），退化为 list(50) 本地过滤` 的 warning。
 401 之类真错误照常报出来，不吞。
 
@@ -376,7 +412,7 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 
 ## 出网说明
 
-`mailer.py` 里做了双通道：
+`core/mailer.py` 里做了双通道：
 
 1. 先**直连** `api.agentmail.to`
 2. 如果回来的是**网关的 HTML 错误页**（比如内网 FortiGate 返回 403 HTML），自动**回退代理**重试
@@ -411,7 +447,7 @@ push 到任意分支、以及所有 PR 都会跑：
 
 | job | 干什么 |
 | --- | --- |
-| `lint + selftest (py3.12 / py3.13)` | `python -m compileall -q .` → `ruff check .` → `PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline` |
+| `lint + selftest (py3.12 / py3.13)` | `python -m compileall -q .` → `ruff check .` → `PYTHONDONTWRITEBYTECODE=1 python3 tests/selftest.py --offline` |
 | `manifest 体检` | `metadata.yaml` 能被 YAML 解析、必填字段（name/display_name/desc/version/author/repo/astrbot_version）齐全、`repo` 等于当前仓库地址、`name` 等于仓库名；`_conf_schema.json` 是合法 JSON 且每项都有 `description`/`type`/`default` |
 
 Python 矩阵只放 `3.12` / `3.13`：AstrBot 自己的约束是 `requires-python = ">=3.12"`（见 `astrbot_src/pyproject.toml`），3.10 / 3.11 上的兼容性没有意义。
@@ -421,10 +457,10 @@ Python 矩阵只放 `3.12` / `3.13`：AstrBot 自己的约束是 `requires-pytho
 ```bash
 pip install ruff
 ruff check .                                     # 规则见 ruff.toml：行宽 120、target py312、E/W/F/I/B/C4
-PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline
+PYTHONDONTWRITEBYTECODE=1 python3 tests/selftest.py --offline
 ```
 
-`selftest.py --offline` 不需要真 key，用假的 `am_test_dummy` 跑（断言全是桩、不打网络）；不带 `--offline` 又读不到 `~/.secrets/agentmail.key` 时，会打一行提示然后自动降级成离线模式，不会抛 traceback。
+`tests/selftest.py --offline` 不需要真 key，用假的 `am_test_dummy` 跑（断言全是桩、不打网络）；不带 `--offline` 又读不到 `~/.secrets/agentmail.key` 时，会打一行提示然后自动降级成离线模式，不会抛 traceback。
 
 ### 发版：`.github/workflows/release.yml`
 
@@ -437,28 +473,28 @@ git tag v0.5.1
 git push origin v0.5.1
 ```
 
-然后工作流会：校验 tag ↔ version → 打包 `astrbot_plugin_agentmail-<version>.zip`（zip **顶层就是 `astrbot_plugin_agentmail/` 文件夹**，里面的 `metadata.yaml` / `main.py` / `_conf_schema.json` 一应俱全；已排除 `__pycache__` / `.git` / `selftest.py` / CI 自身）→ 用 `gh release create` 建 Release、挂上 zip，release notes 自动取 `git log`（上一个 tag 到这次的提交）。
+然后工作流会：校验 tag ↔ version → 打包 `astrbot_plugin_agentmail-<version>.zip`（zip **顶层就是 `astrbot_plugin_agentmail/` 文件夹**，里面的 `metadata.yaml` / `main.py` / `_conf_schema.json` 一应俱全，运行期代码所在的 `core/` `push/` `tools/` 三个子包整目录打进去；已排除 `__pycache__` / `.git` / `tests/` / `docs/` / CI 自身）→ 用 `gh release create` 建 Release、挂上 zip，release notes 自动取 `git log`（上一个 tag 到这次的提交）。
 
 不想为了验证就污染仓库？用 **workflow_dispatch**：Actions → Release → Run workflow，只做「校验 tag ↔ version + 打包 + 上传 artifact」，默认**不**建 Release（想真发才勾 `publish`）。也可以故意填错 tag（如 `v9.9.9`）看它红。
 
 ## 原理备忘
 
 ```
-/mail send ...  →  权限（perm.py：放行/拒绝 + 原因）→ 限流（limits.py：冷却/每日额度）
-                →  Mailer.send()  →  POST /v0/inboxes/{inbox}/messages/send
+/mail send ...  →  权限（core/perm.py：放行/拒绝 + 原因）→ 限流（core/limits.py：冷却/每日额度）
+                →  Mailer.send()（core/mailer.py）→  POST /v0/inboxes/{inbox}/messages/send
                                     （cc / bcc 是接口原生字段）
-                →  审计（audit.py：sqlite3 落一条）→  回执
+                →  审计（core/audit.py：sqlite3 落一条）→  回执
 ```
 
 ```markdown
-收信推送 + 附件 → Mailer.list()           →  GET  /v0/inboxes/{inbox}/messages
+收信推送 + 附件 → Mailer.list()（push/attach.py 拼清单/文件组件）→  GET  /v0/inboxes/{inbox}/messages
                 → Mailer.attachment_info() →  GET  /v0/inboxes/{inbox}/messages/{id}/attachments/{aid}
                                              →  download_url（带签名、会过期，现取现用）
 
-每日未读摘要    → asyncio 定时（本地时间，同一天只推一次，日期存 KV）
+每日未读摘要    → asyncio 定时（push/digest.py：本地时间，同一天只推一次，日期存 KV）
                 → Mailer.list(50) → 未读计数 + 最新 3 封 → MessageChain([Plain]) → send_message
 
-/mail log       → audit.AuditLog.recent(n) → format_log_rows() → 纯文本回执
+/mail log       → core/audit.AuditLog.recent(n) → format_log_rows() → 纯文本回执
 ```
 
 接口文档：<https://docs.agentmail.to>（OpenAPI：<https://docs.agentmail.to/openapi.json>，注意路径是 `/v0`）

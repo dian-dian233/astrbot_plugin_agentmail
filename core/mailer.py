@@ -27,18 +27,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-try:  # 插件包内导入
-    from .search import (
-        DEFAULT_LIMIT,
-        filter_messages,
-        normalize_limit,
-    )
-except ImportError:  # 单独运行 / 被平铺加载时
-    from search import (  # type: ignore[no-redef]
-        DEFAULT_LIMIT,
-        filter_messages,
-        normalize_limit,
-    )
+from ..tools.search import (
+    DEFAULT_LIMIT,
+    filter_messages,
+    normalize_limit,
+)
 
 logger = logging.getLogger("astrbot_plugin_agentmail")
 # 服务端搜索端点"不可用"的状态码：这些情况退化成本地过滤，其它错误（401 等）照常抛

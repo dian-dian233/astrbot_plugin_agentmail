@@ -23,8 +23,8 @@
 底部会打印「通过 / 失败条数」（实测，不是硬编码）。
 
 用法：
-    PYTHONDONTWRITEBYTECODE=1 python3 selftest.py            # 含真实 API 抽查（没 key/没网 自动降级为 offline）
-    PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline  # 只跑本地断言（不需要真 key，用假的 am_test_dummy）
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/selftest.py            # 含真实 API 抽查（没 key/没网 自动降级为 offline）
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/selftest.py --offline  # 只跑本地断言（不需要真 key，用假的 am_test_dummy）
 
 CI 里跑的就是 --offline：不读 ~/.secrets/agentmail.key、不连网络，纯本地断言。
 """
@@ -35,7 +35,9 @@ import tempfile
 import types
 from datetime import datetime
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# 本文件现在在 tests/ 下：HERE 仍然指「仓库根目录」（往上两级），语义和重构前一样，
+# 下面的「审计库不许写进仓库目录」断言就靠它。仓库根进 sys.path，包才能被 import。
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OFFLINE = "--offline" in sys.argv
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))  # 兼容放在 plugins/ 下、以包形式导入
@@ -126,77 +128,54 @@ sys.modules.update({
     "astrbot.api.star": star_mod,
 })
 
-try:
-    from astrbot_plugin_agentmail.attach import (  # noqa: E402
-        attachment_block,
-        extract_attachments,
-        human_size,
-    )
-    from astrbot_plugin_agentmail.audit import (  # noqa: E402
-        AuditLog,
-        db_path,
-        format_log_rows,
-        resolve_data_dir,
-    )
-    from astrbot_plugin_agentmail.digest import (  # noqa: E402
-        format_digest,
-        is_due,
-        next_check_delay,
-        parse_time,
-    )
-    from astrbot_plugin_agentmail.limits import (  # noqa: E402
-        after_success,
-        check_send_limit,
-        format_limit_message,
-        format_quota_note,
-        read_cooldown,
-        read_daily_limit,
-    )
-    from astrbot_plugin_agentmail.mailer import Mailer, MailError  # noqa: E402
-    from astrbot_plugin_agentmail.main import DIGEST_KEY, AgentMailPlugin  # noqa: E402
-    from astrbot_plugin_agentmail.notify import render_notice  # noqa: E402
-    from astrbot_plugin_agentmail.perm import (  # noqa: E402
-        REASON_BAD_BOOL,
-        REASON_DM,
-        REASON_GROUP,
-        evaluate,
-    )
-    from astrbot_plugin_agentmail.search import (  # noqa: E402
-        filter_messages,
-        format_rows,
-        matches,
-        normalize_limit,
-        parse_search_args,
-    )
-    from astrbot_plugin_agentmail.sendargs import (  # noqa: E402
-        SendArgs,
-        SendArgsError,
-        parse_send_args,
-    )
-except ImportError:  # 仓库根目录直接跑
-    from attach import attachment_block, extract_attachments, human_size  # noqa: E402
-    from audit import AuditLog, db_path, format_log_rows, resolve_data_dir  # noqa: E402
-    from digest import format_digest, is_due, next_check_delay, parse_time  # noqa: E402
-    from limits import (  # noqa: E402
-        after_success,
-        check_send_limit,
-        format_limit_message,
-        format_quota_note,
-        read_cooldown,
-        read_daily_limit,
-    )
-    from mailer import Mailer, MailError  # noqa: E402
-    from main import DIGEST_KEY, AgentMailPlugin  # noqa: E402
-    from notify import render_notice  # noqa: E402
-    from perm import REASON_BAD_BOOL, REASON_DM, REASON_GROUP, evaluate  # noqa: E402
-    from search import (  # noqa: E402
-        filter_messages,
-        format_rows,
-        matches,
-        normalize_limit,
-        parse_search_args,
-    )
-    from sendargs import SendArgs, SendArgsError, parse_send_args  # noqa: E402
+# 目录重构后：模块都在 core/ push/ tools/ 子包里。这里只保留包方式导入，
+# 原来的平铺兜底（from attach import ...）随重构一起删掉——根目录已经没有那些模块了。
+from astrbot_plugin_agentmail.core.audit import (  # noqa: E402
+    AuditLog,
+    db_path,
+    format_log_rows,
+    resolve_data_dir,
+)
+from astrbot_plugin_agentmail.core.limits import (  # noqa: E402
+    after_success,
+    check_send_limit,
+    format_limit_message,
+    format_quota_note,
+    read_cooldown,
+    read_daily_limit,
+)
+from astrbot_plugin_agentmail.core.mailer import Mailer, MailError  # noqa: E402
+from astrbot_plugin_agentmail.core.perm import (  # noqa: E402
+    REASON_BAD_BOOL,
+    REASON_DM,
+    REASON_GROUP,
+    evaluate,
+)
+from astrbot_plugin_agentmail.core.sendargs import (  # noqa: E402
+    SendArgs,
+    SendArgsError,
+    parse_send_args,
+)
+from astrbot_plugin_agentmail.main import DIGEST_KEY, AgentMailPlugin  # noqa: E402
+from astrbot_plugin_agentmail.push.attach import (  # noqa: E402
+    attachment_block,
+    extract_attachments,
+    human_size,
+)
+from astrbot_plugin_agentmail.push.digest import (  # noqa: E402
+    format_digest,
+    is_due,
+    next_check_delay,
+    parse_time,
+)
+from astrbot_plugin_agentmail.push.notify import render_notice  # noqa: E402
+from astrbot_plugin_agentmail.tools.search import (  # noqa: E402
+    filter_messages,
+    format_rows,
+    matches,
+    normalize_limit,
+    parse_search_args,
+)
 
 
 class FakeEvent:
