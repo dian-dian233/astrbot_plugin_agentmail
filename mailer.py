@@ -11,12 +11,18 @@
    `list(50)` 拉下来用 search.py 里的纯函数本地过滤，并在日志里记一条 warning。
 4. v0.5.0 加了 `attachment_info()`：拿附件的 `download_url`（带签名、会过期，
    所以每次发附件都重新问一次，不做任何缓存）。
+5. v0.6.0 的 `send()` 支持真 `cc` / `bcc`：AgentMail 的 SendMessageRequest 本身就有这两个
+   字段（Addresses = string | list of string），见
+   https://docs.agentmail.to/api-reference/inboxes/messages/send 。
+   万一某个老部署回 400/422 抱怨这俩字段，自动去掉 cc/bcc 重发一次、
+   把 CC/BCC 写进正文开头，并在返回体里标 `cc_fallback=True` 让上层如实说明。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -57,6 +63,23 @@ def _as_list(value) -> list[str]:
     if isinstance(value, str):
         return [x.strip() for x in value.replace("；", ",").replace(";", ",").split(",") if x.strip()]
     return [str(x).strip() for x in value if str(x).strip()]
+
+
+# 服务端「不认识 cc/bcc 字段」的错误长什么样：校验错误里点到 'cc'/'bcc'，
+# 或者明说 unknown field / additionalProperties / not permitted。
+_CC_FIELD_RE = re.compile(r"['\"]b?cc['\"]", re.IGNORECASE)
+_CC_WORD_RE = re.compile(
+    r"unknown field|additional propert|unexpected|not permitted|not allowed|unsupported|unknown parameter",
+    re.IGNORECASE,
+)
+
+
+def _cc_unsupported(error: "MailError") -> bool:
+    """判断这次 400/422 是不是「因为带了 cc/bcc」被拒的（只认字段级抱怨，不误伤别的 400）。"""
+    if getattr(error, "status", 0) not in (400, 422):
+        return False
+    detail = str(error)
+    return bool(_CC_WORD_RE.search(detail)) or bool(_CC_FIELD_RE.search(detail))
 
 
 class Mailer:
@@ -125,20 +148,65 @@ class Mailer:
         raise MailError(last_msg)
 
     # ── 业务 ────────────────────────────────────────────────
-    def send(self, to, subject: str, text: str = "", html: str = "") -> dict:
+    def send(
+        self,
+        to,
+        subject: str,
+        text: str = "",
+        html: str = "",
+        cc=None,
+        bcc=None,
+        *,
+        cc_fallback: bool = True,
+    ) -> dict:
+        """发信。
+
+        `cc` / `bcc` 是**真的 CC/BCC**：AgentMail 的 SendMessageRequest 里就有
+        `cc` / `bcc` 两个字段（Addresses = string | list of string），
+        见 https://docs.agentmail.to/api-reference/inboxes/messages/send
+        所以这里直接放进 payload，收件人之间互相看不见 BCC 是邮件协议本身保证的。
+
+        `cc_fallback=True`（默认）时留一条后路：万一对端回 400/422 且明确抱怨
+        `cc` / `bcc` 字段（比如老部署还没上线这两个字段），就**去掉 cc/bcc 重发一次**，
+        并把 CC/BCC 写进正文开头，返回体里带 `cc_fallback=True` 让上层如实告诉用户
+        「API 不支持真 CC，已写在正文」——不许假装支持。
+        """
         recipients = _as_list(to)
         if not recipients:
             raise MailError("收件人为空")
         if not subject:
             raise MailError("主题为空")
+        cc_list = _as_list(cc)
+        bcc_list = _as_list(bcc)
         payload = {"to": recipients, "subject": subject}
+        if cc_list:
+            payload["cc"] = cc_list
+        if bcc_list:
+            payload["bcc"] = bcc_list
         if text:
             payload["text"] = text
         if html:
             payload["html"] = html
         if not text and not html:
             payload["text"] = "（无正文）"
-        return self.request(f"/inboxes/{self.inbox}/messages/send", "POST", payload)
+        path = f"/inboxes/{self.inbox}/messages/send"
+        try:
+            return self.request(path, "POST", payload)
+        except MailError as e:
+            if not (cc_list or bcc_list) or not cc_fallback or not _cc_unsupported(e):
+                raise
+            logger.warning(f"[agentmail] 服务端不认 cc/bcc 字段（{e}），改为把 CC/BCC 写进正文重发")
+            payload.pop("cc", None)
+            payload.pop("bcc", None)
+            header = []
+            if cc_list:
+                header.append("CC: " + ", ".join(cc_list))
+            if bcc_list:
+                header.append("BCC: " + ", ".join(bcc_list))
+            header.append("（AgentMail 接口不支持 CC/BCC 字段，改写在正文里）")
+            payload["text"] = "\n".join(header + ["", payload.get("text") or "（无正文）"])
+            data = self.request(path, "POST", payload)
+            return {**data, "cc_fallback": True, "cc": cc_list, "bcc": bcc_list}
 
     def list(self, limit: int = 5) -> list[dict]:
         data = self.request(f"/inboxes/{self.inbox}/messages?limit={max(1, min(50, int(limit)))}")
