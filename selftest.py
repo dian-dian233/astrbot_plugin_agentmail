@@ -9,6 +9,18 @@
         attachments 脏数据（None、字符串、空 list…）不崩 / 超长清单折叠
       + v0.5.0 功能 B 每日未读摘要：到点触发一次 / 同一天第二次（含重启）不推 /
         digest_time 非法回退 09:00 / 摘要正文（未读数量 + 最新 3 封）/ 会话不可达只记 warning
+      + v0.6.0 功能 A 权限拒绝原因化：私聊 / 群聊 / allow_all 类型不对 三种原因各一条，
+        文案带「原因 + 解决」，放行四条路（allow_all / 管理员 / allowed_users /
+        allowed_groups）都对，指令和 LLM 工具共用同一段文案，日志记下「谁 / 哪个会话 / 哪条规则」
+      + v0.6.0 功能 B 发件审计：成功 / 失败都落 sqlite3 一条（时间、触发者、会话类型/ID、
+        收件人、CC/BCC、主题、正文长度、message_id、结果）/ 库不在插件仓库目录 /
+        `/mail log` 默认 10 条按时间倒序 / `/mail log n` 限条数 / 空库提示 / 没权限看不到
+      + v0.6.0 功能 C 发送限流 + CC/BCC：冷却未到期拦住并给出剩余秒数、到期放行、
+        每日额度用完拦住并给出剩余条数、两者都超优先报额度、0 = 关掉限制、
+        失败不占额度、被拦也记审计；`--cc/--bcc` 解析、真实 cc/bcc 进 payload、
+        服务端不认 cc 时降级并把 CC 写进正文且如实回报
+
+底部会打印「通过 / 失败条数」（实测，不是硬编码）。
 
 用法：
     PYTHONDONTWRITEBYTECODE=1 python3 selftest.py            # 含真实 API 抽查（没 key/没网 自动降级为 offline）
@@ -19,6 +31,7 @@ CI 里跑的就是 --offline：不读 ~/.secrets/agentmail.key、不连网络，
 import asyncio
 import os
 import sys
+import tempfile
 import types
 from datetime import datetime
 
@@ -119,15 +132,35 @@ try:
         extract_attachments,
         human_size,
     )
+    from astrbot_plugin_agentmail.audit import (  # noqa: E402
+        AuditLog,
+        db_path,
+        format_log_rows,
+        resolve_data_dir,
+    )
     from astrbot_plugin_agentmail.digest import (  # noqa: E402
         format_digest,
         is_due,
         next_check_delay,
         parse_time,
     )
+    from astrbot_plugin_agentmail.limits import (  # noqa: E402
+        after_success,
+        check_send_limit,
+        format_limit_message,
+        format_quota_note,
+        read_cooldown,
+        read_daily_limit,
+    )
     from astrbot_plugin_agentmail.mailer import Mailer, MailError  # noqa: E402
     from astrbot_plugin_agentmail.main import DIGEST_KEY, AgentMailPlugin  # noqa: E402
     from astrbot_plugin_agentmail.notify import render_notice  # noqa: E402
+    from astrbot_plugin_agentmail.perm import (  # noqa: E402
+        REASON_BAD_BOOL,
+        REASON_DM,
+        REASON_GROUP,
+        evaluate,
+    )
     from astrbot_plugin_agentmail.search import (  # noqa: E402
         filter_messages,
         format_rows,
@@ -135,12 +168,27 @@ try:
         normalize_limit,
         parse_search_args,
     )
+    from astrbot_plugin_agentmail.sendargs import (  # noqa: E402
+        SendArgs,
+        SendArgsError,
+        parse_send_args,
+    )
 except ImportError:  # 仓库根目录直接跑
     from attach import attachment_block, extract_attachments, human_size  # noqa: E402
+    from audit import AuditLog, db_path, format_log_rows, resolve_data_dir  # noqa: E402
     from digest import format_digest, is_due, next_check_delay, parse_time  # noqa: E402
+    from limits import (  # noqa: E402
+        after_success,
+        check_send_limit,
+        format_limit_message,
+        format_quota_note,
+        read_cooldown,
+        read_daily_limit,
+    )
     from mailer import Mailer, MailError  # noqa: E402
     from main import DIGEST_KEY, AgentMailPlugin  # noqa: E402
     from notify import render_notice  # noqa: E402
+    from perm import REASON_BAD_BOOL, REASON_DM, REASON_GROUP, evaluate  # noqa: E402
     from search import (  # noqa: E402
         filter_messages,
         format_rows,
@@ -148,6 +196,7 @@ except ImportError:  # 仓库根目录直接跑
         normalize_limit,
         parse_search_args,
     )
+    from sendargs import SendArgs, SendArgsError, parse_send_args  # noqa: E402
 
 
 class FakeEvent:
@@ -183,16 +232,34 @@ class FakeMailer:
 
     v0.5.0 加 `attachment_info()`：默认按 message_id / attachment_id 拼一个假 download_url，
     传 attachment_error 就抛 MailError（模拟取下载地址失败）。
+    v0.6.0 加 `send()`：记下每次发送的收件人 / cc / bcc / 主题 / 正文，返回假 message_id；
+    传 send_error 就抛 MailError（模拟发送失败）。
     """
 
-    def __init__(self, messages, attachment_error=None):
+    def __init__(self, messages, attachment_error=None, send_error=None, cc_fallback=False):
         self.messages = messages
         self.search_calls = []
         self.attachment_calls = []
         self.attachment_error = attachment_error
+        self.send_error = send_error
+        self.cc_fallback = cc_fallback
+        self.send_calls = []
+        self._seq = 0
 
     def list(self, limit=5):
         return self.messages[:limit]
+
+    def send(self, to, subject, text="", html="", cc=None, bcc=None):
+        self._seq += 1
+        self.send_calls.append(
+            {"to": to, "subject": subject, "text": text, "html": html, "cc": cc, "bcc": bcc}
+        )
+        if self.send_error:
+            raise MailError(str(self.send_error), 400)
+        res = {"message_id": f"fake-msg-{self._seq}", "thread_id": f"fake-thread-{self._seq}"}
+        if self.cc_fallback:
+            res["cc_fallback"] = True
+        return res
 
     def search(self, keyword, limit=5):
         self.search_calls.append((keyword, limit))
@@ -225,6 +292,9 @@ BASE_CONF = {
     "allow_all": False,
     "allowed_users": ["1150880493"],
     "allowed_groups": [],
+    "send_cooldown": 30,
+    "send_daily_limit": 50,
+    "audit_data_dir": "",  # conf() 会换成每次独立的临时目录
     "poll_enabled": True,
     "poll_interval": 300,
     "notify_sessions": ["aiocqhttp:FriendMessage:1150880493"],
@@ -236,11 +306,21 @@ BASE_CONF = {
     "digest_sessions": [],
 }
 
+# 审计库一律写临时目录（顺带验证「不写插件仓库目录」）
+TMP_ROOT = tempfile.mkdtemp(prefix="agentmail-selftest-")
+
 
 def conf(**over):
     c = dict(BASE_CONF)
+    if "audit_data_dir" not in over:  # 每个用例一个干净审计库，互不干扰
+        c["audit_data_dir"] = tempfile.mkdtemp(prefix="audit-", dir=TMP_ROOT)
     c.update(over)
     return c
+
+
+def audit_db_of(plugin) -> str:
+    """拿到某个插件实例实际用的审计库路径。"""
+    return plugin._audit_log().path
 
 
 async def run(handler, evt, label):
@@ -746,6 +826,343 @@ async def test_digest():
     print("⑥ 摘要和收信轮询共用同一个 Mailer 实例（同一个 _mailer_or_raise）✅")
 
 
+def test_permission():
+    print("\n── 权限拒绝原因化（v0.6.0 功能 A）──")
+    base = {"allow_all": False, "allowed_users": ["1150880493"], "allowed_groups": ["680787260"]}
+
+    # ① 私聊：allow_all 关 + 用户不在 allowed_users + 会话也不在 allowed_groups
+    d = evaluate({**base, "allowed_users": []}, sender="999", group="", umo="aiocqhttp:FriendMessage:999")
+    assert d.allowed is False and d.reason == REASON_DM, d
+    assert "这个会话没有邮件权限" in d.message
+    assert "原因：" in d.message and "解决：" in d.message
+    assert "999 不在 allowed_users" in d.message, d.message
+    assert "WebUI → 插件配置 → allowed_users" in d.message, d.message
+    assert "私聊" in d.message and "allowed_groups 只对群聊生效" in d.message
+    print("① 私聊被拒 →", d.reason)
+    for line in d.message.splitlines():
+        print("   ", line)
+
+    # ② 群聊：allow_all 关 + 用户不在 allowed_users + 群不在 allowed_groups
+    d2 = evaluate(base, sender="999", group="111222", umo="aiocqhttp:GroupMessage:111222")
+    assert d2.allowed is False and d2.reason == REASON_GROUP, d2
+    assert "999 不在 allowed_users" in d2.message and "群 111222 也不在 allowed_groups" in d2.message, d2.message
+    assert "把群号 111222 填进 allowed_groups" in d2.message, d2.message
+    print("② 群聊被拒 →", d2.reason)
+    for line in d2.message.splitlines():
+        print("   ", line)
+
+    # ③ allow_all 的类型不对（老代码会把 "off" 这种非空字符串当成「开」，直接放行所有人）
+    for raw in ("off", "false", "关闭吧", "maybe", [1], {}):
+        d3 = evaluate({"allow_all": raw, "allowed_users": [], "allowed_groups": []},
+                      sender="999", group="111222", umo="aiocqhttp:GroupMessage:111222")
+        assert d3.allowed is False, (raw, d3)
+        assert d3.reason == REASON_BAD_BOOL, (raw, d3.reason)
+        assert "不是真正的布尔值" in d3.message and "allow_all" in d3.message, (raw, d3.message)
+    d3b = evaluate({"allow_all": "off", "allowed_users": [], "allowed_groups": []}, sender="999")
+    assert "已按「关闭」处理" in d3b.message, d3b.message
+    print("③ allow_all 类型不对（off / false / 关闭吧 / maybe / [1] / {}）→ 按关闭处理 + 指出正确写法 ✅")
+
+    # ④ 四种放行路径：allow_all / 管理员 / allowed_users / allowed_groups
+    allow_cases = [
+        ({"allow_all": True, "allowed_users": [], "allowed_groups": []}, "999", "", False, "allow_all"),
+        ({"allow_all": False, "allowed_users": [], "allowed_groups": []}, "999", "", True, "admin"),
+        (base, "1150880493", "", False, "allowed_users"),
+        (base, "999", "680787260", False, "allowed_groups"),
+        ({"allow_all": "true", "allowed_users": [], "allowed_groups": []}, "999", "", False, "allow_all"),
+        ({"allow_all": 2, "allowed_users": [], "allowed_groups": []}, "999", "", False, "allow_all"),
+    ]
+    for cfg, sender, group, admin, rule in allow_cases:
+        got = evaluate(cfg, sender=sender, group=group, is_admin=admin)
+        assert got.allowed is True and got.rule == rule, (cfg, sender, group, admin, got)
+        assert got.message == "" and got.reason == "ok"
+    print("④ 放行四条路：allow_all / 管理员 / allowed_users / allowed_groups（含字符串 \"true\"、数字 2）✅")
+
+    # ⑤ 拿不到 ID 也不能崩，要说清「没法比白名单」
+    d5 = evaluate(base, sender="", group="", umo="")
+    assert d5.allowed is False and d5.reason == "not_whitelisted_no_id", d5
+    assert "没法跟白名单比对" in d5.message
+    print("⑤ 拿不到 sender/群号 →", d5.reason, "（不崩，给出替代解法）✅")
+    return d
+
+
+async def test_permission_integration():
+    """/mail 和 LLM 工具都要用新的原因文案，且日志里记下「谁 / 哪个会话 / 被哪条规则挡」。"""
+    print("\n── 权限拒绝：指令 / LLM 工具 / 日志（v0.6.0 功能 A）──")
+    ctx = FakeContext()
+    p = AgentMailPlugin(ctx, conf(allowed_users=["1150880493"], allowed_groups=[]))
+    p._mailer = FakeMailer([])
+
+    WARNINGS.clear()
+    out = await collect(p.mail, FakeEvent("/mail", admin=False, sender="1150880493"))
+    assert len(out) == 1 and "AgentMail 邮件工具" in out[0], out  # 本人在白名单里 → 放行，回帮助
+    WARNINGS.clear()
+    evt = FakeEvent("/mail send a@x.com 测试 | 正文", admin=False, sender="999")
+    out = await collect(p.mail, evt)
+    assert "原因：" in out[0] and "解决：" in out[0], out
+    assert "这个会话没开邮件权限" not in out[0], "还在用 v0.5.x 那句老文案"
+    assert any("权限拒绝" in w and "reason=not_whitelisted_dm" in w and "user=999" in w for w in WARNINGS), WARNINGS
+    print("① /mail send 被拒 → 原因 + 解决（不再是一句「发不了」）")
+    for line in out[0].splitlines():
+        print("   ", line)
+    print("   日志 →", [w for w in WARNINGS if "权限拒绝" in w][0])
+
+    WARNINGS.clear()
+    res = await p.agentmail_send(evt, "a@x.com", "测试", "正文")
+    assert res == p._permission(evt).message, res
+    assert "原因：" in res and "解决：" in res and "allowed_users" in res, res
+    assert any("权限拒绝" in w for w in WARNINGS), WARNINGS
+    print("② LLM 工具 agentmail_send 返回同一段原因文案（模型能直接转述给用户）✅")
+
+    # 群聊场景：文案里要同时出现 QQ 号和群号
+    WARNINGS.clear()
+    g_evt = FakeEvent("/mail send a@x.com 群里试试 | 正文", admin=False, sender="999",
+                      group="111222", umo="aiocqhttp:GroupMessage:111222")
+    out = await collect(p.mail, g_evt)
+    assert "111222" in out[0] and "999" in out[0] and "allowed_groups" in out[0], out
+    assert any("reason=not_whitelisted_group" in w for w in WARNINGS), WARNINGS
+    print("③ 群聊被拒 → 群里文案同时点出 QQ 号 999 和群号 111222 ✅")
+
+
+async def test_audit():
+    print("\n── 发件审计 + /mail log（v0.6.0 功能 B）──")
+    repo = os.path.realpath(HERE)
+    ctx = FakeContext()
+    p = AgentMailPlugin(ctx, conf(send_cooldown=0, send_daily_limit=0))
+    p._mailer = FakeMailer([])
+    db = audit_db_of(p)
+    print("审计库：", db)
+    assert db.endswith(os.path.join("plugin_data", "astrbot_plugin_agentmail", "mail_audit.sqlite3")), db
+    assert db_path(os.path.dirname(os.path.dirname(os.path.dirname(db)))) == db, db
+    assert not os.path.realpath(db).startswith(repo), f"审计库不许写进插件仓库目录：{db}"
+    default_dir = resolve_data_dir()
+    assert not os.path.realpath(default_dir).startswith(repo), f"默认数据目录也不许落在仓库里：{default_dir}"
+    assert os.path.isdir(default_dir), default_dir
+    deep = os.path.join(tempfile.mkdtemp(prefix="audit-deep-", dir=TMP_ROOT), "a", "b", "x.sqlite3")
+    fresh = AuditLog(deep)
+    assert fresh.total() == 0 and fresh.recent(5) == [] and os.path.isfile(deep), "新建库应自动建目录、空表可读"
+    print("① 落盘位置：<data>/plugin_data/<插件名>/mail_audit.sqlite3，且不在仓库目录里 ✅")
+
+    # ② 成功发送 → 落一条完整记录
+    out = await collect(p.mail, FakeEvent("/mail send 1150880493@qq.com 第一封 | 正文四个字"))
+    assert "发出去了" in out[0], out
+    rows = p._audit_log().recent(10)
+    assert len(rows) == 1, rows
+    r = rows[0]
+    assert r["ok"] == 1, r
+    assert r["user_id"] == "1150880493" and r["session_type"] == "private", r
+    assert r["session_id"] == "1150880493", r
+    assert r["recipients"] == "1150880493@qq.com" and r["subject"] == "第一封", r
+    assert r["body_len"] == 5 and r["message_id"] == "fake-msg-1", r
+    assert r["ts"] and int(r["duration_ms"]) >= 0 and not r["error"], r
+    print("② 成功一条落库：", r["ts"], r["session_type"], r["session_id"], "→", r["recipients"], "id=", r["message_id"])
+
+    # ③ 失败也要落（成功和失败都记）
+    p._mailer = FakeMailer([], send_error="HTTP 400：bad request")
+    out2 = await collect(p.mail, FakeEvent("/mail send x@y.com 会失败的 | 正文"))
+    assert "邮件接口出错" in out2[0], out2
+    r2 = p._audit_log().recent(1)[0]
+    assert r2["ok"] == 0 and "HTTP 400" in r2["error"] and r2["message_id"] == "", r2
+    print("③ 发送失败也落库：ok=0，error =", r2["error"])
+
+    # ④ 群聊记录带群号和 session_type=group；CC/BCC 也落库
+    p._mailer = FakeMailer([])
+    out3 = await collect(p.mail, FakeEvent(
+        "/mail send a@x.com --cc b@x.com,c@x.com --bcc d@x.com 群里带抄送 | 正文",
+        group="680787260", umo="aiocqhttp:GroupMessage:680787260",
+    ))
+    assert "发出去了" in out3[0], out3
+    call = p._mailer.send_calls[-1]
+    assert call["cc"] == ["b@x.com", "c@x.com"] and call["bcc"] == ["d@x.com"], call
+    r3 = p._audit_log().recent(1)[0]
+    assert r3["session_type"] == "group" and r3["session_id"] == "680787260", r3
+    assert r3["cc"] == "b@x.com, c@x.com" and r3["bcc"] == "d@x.com", r3
+    print("④ 群聊 + CC/BCC 落库：", r3["session_type"], r3["session_id"], "cc=", r3["cc"], "bcc=", r3["bcc"])
+
+    # ⑤ 读取：/mail log 默认 10 条、按时间倒序、格式固定
+    total = p._audit_log().total()
+    assert total == 3, total
+    log_out = await collect(p.mail, FakeEvent("/mail log"))
+    assert log_out[0] == format_log_rows(p._audit_log().recent(10), total), log_out[0]
+    assert "发件记录（最近 3 条，按时间倒序）" in log_out[0], log_out[0]
+    blocks = log_out[0].split("────────────")
+    assert "群里带抄送" in blocks[0], "最新的一条必须排在最前面"
+    assert "第一封" in blocks[-1], blocks[-1]
+    print("⑤ /mail log 默认 10 条、倒序：最新在最前 ✅")
+    print("   " + log_out[0].splitlines()[0])
+
+    # ⑥ /mail log n 限条数；n 乱写回默认 10；上限 50
+    log2 = await collect(p.mail, FakeEvent("/mail log 2"))
+    assert log2[0].count("发给：") == 2, log2[0]
+    assert "最近 2 条" in log2[0] and "库里共 3 条" in log2[0], log2[0]
+    assert (await collect(p.mail, FakeEvent("/mail log abc")))[0].count("发给：") == 3
+    print("⑥ /mail log 2 → 2 条（并标出库里共 3 条）；/mail log abc → 回默认 10 ✅")
+
+    # ⑦ 空库友好提示 + 没权限的人看不到记录
+    p_empty = AgentMailPlugin(FakeContext(), conf())
+    p_empty._mailer = FakeMailer([])
+    empty = await collect(p_empty.mail, FakeEvent("/mail log"))
+    assert "还没有发件记录" in empty[0], empty
+    denied = await collect(p.mail, FakeEvent("/mail log", admin=False, sender="999"))
+    assert "没有邮件权限" in denied[0] and "发给：" not in denied[0], denied
+    print("⑦ 空库提示「还没有发件记录」；非白名单用户 /mail log 被拦（看不到别人的记录）✅")
+
+    # ⑧ 纯函数排版：脏数据不崩
+    assert format_log_rows([]) == "还没有发件记录。发一封就会记一条（成功和失败都记）。"
+    assert format_log_rows([{"ok": 1, "ts": "2026-10-30 10:00:00"}]).startswith("📨 发件记录（最近 1 条")
+    assert format_log_rows(None) == format_log_rows([])
+    print("⑧ 排版纯函数：空列表 / None / 缺字段的脏记录都不崩 ✅")
+
+
+async def test_limits():
+    print("\n── 发送限流 + CC/BCC（v0.6.0 功能 C）──")
+
+    # ① 冷却：还没到期 → 拦住，并说清「还要等几秒」
+    d = check_send_limit(now=1000.0, last_sent=990.0, used_today=0, cooldown=30, daily_limit=50)
+    assert d["allowed"] is False and d["reason"] == "cooldown", d
+    assert d["retry_after"] == 20 and d["elapsed"] == 10, d
+    msg = format_limit_message(d)
+    assert "还要等 20 秒" in msg and "剩余：20 秒" in msg and "send_cooldown" in msg, msg
+    assert "上一次是 10 秒前发的" in msg, msg
+    print("① 冷却未到期 →", d["retry_after"], "秒后可发")
+    for line in msg.splitlines():
+        print("   ", line)
+
+    # ② 冷却到期 → 放行
+    d2 = check_send_limit(now=1030.0, last_sent=990.0, used_today=0, cooldown=30, daily_limit=50)
+    assert d2["allowed"] is True and d2["reason"] == "ok" and d2["remaining"] == 50, d2
+    assert format_limit_message(d2) == "", "放行时不该有拦截文案"
+    d2b = check_send_limit(now=1000.0, last_sent=None, cooldown=30, daily_limit=50)
+    assert d2b["allowed"] is True, "第一次发（没有历史）必须放行"
+    assert check_send_limit(now=1000.0, last_sent=1000.0, cooldown=0, daily_limit=50)["allowed"] is True
+    print("② 冷却到期 / 第一次发 / send_cooldown=0 → 放行 ✅")
+
+    # ③ 每日额度：用完 → 拦住，并说清「剩下 0 封」
+    d4 = check_send_limit(now=5000.0, last_sent=None, used_today=50, cooldown=0, daily_limit=50)
+    assert d4["allowed"] is False and d4["reason"] == "daily_limit" and d4["remaining"] == 0, d4
+    msg4 = format_limit_message(d4)
+    assert "今天已经发满 50 封" in msg4 and "剩余：0 封（今天已用 50/50）" in msg4, msg4
+    assert "明天 0 点" in msg4 and "send_daily_limit" in msg4, msg4
+    print("③ 每日额度用完 →", d4["used"], "/", d4["daily_limit"], "剩", d4["remaining"], "封")
+    for line in msg4.splitlines():
+        print("   ", line)
+    # 两个都超 → 报额度（别让人白等冷却）
+    both = check_send_limit(now=1000.0, last_sent=999.0, used_today=50, cooldown=30, daily_limit=50)
+    assert both["reason"] == "daily_limit", both
+    assert check_send_limit(now=0, used_today=999, cooldown=0, daily_limit=0)["allowed"] is True
+    print("④ 冷却和额度同时超 → 优先报额度；send_daily_limit=0 / send_cooldown=0 → 关掉限制 ✅")
+
+    # ⑤ 配置读取容错
+    assert read_cooldown(None) == 30 and read_cooldown("0") == 0 and read_cooldown("abc") == 30
+    assert read_cooldown(-5) == 0 and read_cooldown("45") == 45 and read_cooldown(True) == 1
+    assert read_daily_limit(None) == 50 and read_daily_limit("7") == 7 and read_daily_limit("x") == 50
+    assert read_daily_limit(-1) == 0
+    assert format_quota_note(after_success({"daily_limit": 50, "used": 49, "remaining": 1})) == \
+        "今日额度：剩 0/50 封（今天已发 50 封）"
+    assert format_quota_note({"daily_limit": 0, "remaining": -1}) == ""
+    print("⑤ 配置读取/额度提示：默认 30 秒 / 50 封，写错回默认，0 = 关掉 ✅")
+
+    # ⑥ 集成：连发第二封被冷却挡住，换个人不受影响，冷却过了能发
+    p = AgentMailPlugin(FakeContext(), conf(send_cooldown=30, send_daily_limit=50))
+    p._mailer = FakeMailer([])
+    evt = FakeEvent("/mail send a@x.com 第一封 | 111")
+    o1 = await collect(p.mail, evt)
+    assert "发出去了" in o1[0] and "今日额度：剩 49/50 封" in o1[0], o1
+    o2 = await collect(p.mail, evt)
+    assert "还要等" in o2[0] and "秒" in o2[0] and "send_cooldown" in o2[0], o2
+    assert len(p._mailer.send_calls) == 1, "被限流的那次不许真的调发送接口"
+    p.conf["allowed_users"] = ["1150880493", "888"]
+    o3 = await collect(p.mail, FakeEvent("/mail send a@x.com 第二封 | 222", sender="888"))
+    assert "发出去了" in o3[0], "限流是按人算的，别人不该被连坐"
+    import sqlite3
+
+    log = p._audit_log()
+    with sqlite3.connect(log.path) as conn:  # 把本人那条成功记录往前挪 60 秒＝冷却已过
+        conn.execute("UPDATE mail_audit SET ts_epoch = ts_epoch - 60 WHERE user_id = ? AND ok = 1",
+                     ("1150880493",))
+    o4 = await collect(p.mail, evt)
+    assert "发出去了" in o4[0], o4
+    assert len(p._mailer.send_calls) == 3, p._mailer.send_calls
+    print("⑥ 集成：第二封被冷却拦（不调接口，回「还要等 N 秒」）→ 换人照发 → 冷却过后放行 ✅")
+
+    # ⑦ 集成：每日额度用完的文案 + 被拦也记审计
+    p2 = AgentMailPlugin(FakeContext(), conf(send_cooldown=0, send_daily_limit=1))
+    p2._mailer = FakeMailer([])
+    a1 = await collect(p2.mail, FakeEvent("/mail send a@x.com 一 | 1"))
+    assert "发出去了" in a1[0] and "剩 0/1 封" in a1[0], a1
+    a2 = await collect(p2.mail, FakeEvent("/mail send a@x.com 二 | 2"))
+    assert "今天已经发满 1 封" in a2[0] and "剩余：0 封" in a2[0], a2
+    assert len(p2._mailer.send_calls) == 1
+    blocked = p2._audit_log().recent(1)[0]
+    assert blocked["ok"] == 0 and "限流：daily_limit" in blocked["error"], blocked
+    print("⑦ 集成：send_daily_limit=1 → 第二封回「今天已发满 1 封，剩 0 封」，且被拦也留审计 ✅")
+
+    # ⑧ 失败的那次不吃冷却/额度
+    p3 = AgentMailPlugin(FakeContext(), conf(send_cooldown=30, send_daily_limit=50))
+    p3._mailer = FakeMailer([], send_error="HTTP 500：boom")
+    f1 = await collect(p3.mail, FakeEvent("/mail send a@x.com 失败 | x"))
+    assert "邮件接口出错" in f1[0], f1
+    p3._mailer = FakeMailer([])
+    f2 = await collect(p3.mail, FakeEvent("/mail send a@x.com 接着发 | x"))
+    assert "发出去了" in f2[0], "失败的一次不该占冷却/额度，紧接着必须能发"
+    print("⑧ 发送失败不占冷却和额度（只统计成功记录），紧接着能重发 ✅")
+
+    # ⑨ CC/BCC 参数解析
+    a = parse_send_args("a@x.com,b@y.com --cc c@x.com,d@x.com --bcc e@x.com 明天见 | 正文第一行")
+    assert isinstance(a, SendArgs), a
+    assert a.to == ["a@x.com", "b@y.com"], a
+    assert a.cc == ["c@x.com", "d@x.com"] and a.bcc == ["e@x.com"], a
+    assert a.subject == "明天见" and a.body == "正文第一行", a
+    b = parse_send_args("a@x.com --cc c@x.com 明天见 | 正文")
+    assert b.cc == ["c@x.com"] and b.subject == "明天见", "紧跟 --cc 的中文词不能被当成抄送地址"
+    c = parse_send_args("a@x.com --CC c@x.com 周报")
+    assert c.cc == ["c@x.com"] and c.subject == "周报" and c.body == "", c
+    d9 = parse_send_args("a@x.com 没有正文只有主题")
+    assert d9.subject == "没有正文只有主题" and d9.body == "" and d9.cc == [], d9
+    for bad in ("", "   ", "a@x.com --cc", "a@x.com --cc 明天见 | 正文", "--cc a@x.com 主题 | 正文"):
+        try:
+            parse_send_args(bad)
+        except SendArgsError:
+            continue
+        raise AssertionError(f"这些参数应该报错：{bad!r}")
+    print("⑨ --cc/--bcc 解析：多个地址 / 大小写 / 中文主题不被吃掉 / 缺地址报错 ✅")
+
+    # ⑩ Mailer 真的把 cc/bcc 放进 payload；服务端不认时降级并如实回报
+    class _CaptureMailer(Mailer):
+        def __init__(self, fail_first=None):
+            super().__init__(api_key="k", inbox="box@agentmail.to")
+            self.payloads = []
+            self.fail_first = fail_first
+
+        def request(self, path, method="GET", body=None):
+            self.payloads.append(body)
+            if self.fail_first and len(self.payloads) == 1:
+                raise MailError(self.fail_first, 400)
+            return {"message_id": "real-1", "thread_id": "t-1"}
+
+    m = _CaptureMailer()
+    m.send(["a@x.com"], "主题", "正文", cc=["c@x.com"], bcc=["d@x.com"])
+    assert m.payloads[-1]["cc"] == ["c@x.com"] and m.payloads[-1]["bcc"] == ["d@x.com"], m.payloads[-1]
+    m2 = _CaptureMailer()
+    m2.send(["a@x.com"], "主题", "正文")
+    assert "cc" not in m2.payloads[-1] and "bcc" not in m2.payloads[-1], "没写 cc/bcc 时请求体和 v0.5.x 一致"
+    print("⑩ 真实 cc/bcc 进 payload：", m.payloads[-1])
+
+    m3 = _CaptureMailer(fail_first="unknown field 'cc'")
+    res = m3.send(["a@x.com"], "主题", "正文", cc=["c@x.com"])
+    assert res.get("cc_fallback") is True and len(m3.payloads) == 2, (res, m3.payloads)
+    assert "cc" not in m3.payloads[1] and "CC: c@x.com" in m3.payloads[1]["text"], m3.payloads[1]
+    print("⑩′ 服务端不认 cc → 去掉字段重发 + CC 写进正文 + 回报 cc_fallback=True（不假装支持）✅")
+
+    m4 = _CaptureMailer(fail_first="invalid 'to' address")
+    try:
+        m4.send(["a@x.com"], "主题", "正文", cc=["c@x.com"])
+    except MailError as e:
+        assert e.status == 400 and len(m4.payloads) == 1, (e, m4.payloads)
+    else:
+        raise AssertionError("别的 400 不该被当成 cc 不支持")
+    print("⑩″ 与 cc 无关的 400 不退化，照常抛（不吞错）✅")
+
+
 async def main():
     global OFFLINE
     key = read_key()
@@ -822,7 +1239,66 @@ async def main():
     # ── v0.5.0 功能 B：每日未读摘要 ──
     await test_digest()
 
+    # ── v0.6.0 功能 A：权限拒绝原因化 ──
+    test_permission()
+    await test_permission_integration()
+
+    # ── v0.6.0 功能 B：发件审计 + /mail log ──
+    await test_audit()
+
+    # ── v0.6.0 功能 C：发送限流 + CC/BCC ──
+    await test_limits()
+
+
+# ── 断言计数（v0.6.0）：让「通过/失败条数」是实测出来的，不是拍脑袋 ─────
+ASSERT_STATS = {"pass": 0, "fail": 0}
+
+
+def _install_assert_counter():
+    """用 sys.settrace 数「执行到的 assert 语句」条数。
+
+    不重写历史断言（828 行里的 assert 一个都不动），只在行事件里看这行源码
+    是不是以 `assert` 开头；失败的那条会让脚本抛 AssertionError，
+    由 `__main__` 兜住并记一条失败。
+    """
+    import linecache
+
+    target = os.path.abspath(__file__)
+    cache: dict[int, str] = {}
+
+    def local_trace(frame, event, arg):
+        if event == "line" and os.path.abspath(frame.f_code.co_filename) == target:
+            lineno = frame.f_lineno
+            text = cache.get(lineno)
+            if text is None:
+                text = linecache.getline(target, lineno).lstrip()
+                cache[lineno] = text
+            if text.startswith("assert ") or text.startswith("assert("):
+                ASSERT_STATS["pass"] += 1
+        return local_trace
+
+    def global_trace(frame, event, arg):
+        if event == "call" and os.path.abspath(frame.f_code.co_filename) == target:
+            return local_trace
+        return None
+
+    sys.settrace(global_trace)
+
+
+def _summary() -> int:
+    ok, fail = ASSERT_STATS["pass"], ASSERT_STATS["fail"]
+    print("\n── 断言统计 ──")
+    print(f"通过：{ok} 条   失败：{fail} 条")
+    return 0 if fail == 0 else 1
+
+
+if __name__ == "__main__":
+    _install_assert_counter()
+    try:
+        asyncio.run(main())
+    except AssertionError as e:
+        ASSERT_STATS["fail"] += 1
+        print("\n[FAIL] 断言失败：", e)
+        sys.exit(_summary())
     print("\n全部断言通过 ✅")
-
-
-asyncio.run(main())
+    sys.exit(_summary())

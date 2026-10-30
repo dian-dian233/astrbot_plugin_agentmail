@@ -50,6 +50,9 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 | `allow_all` | 是否允许所有会话使用。**默认关**，只放管理员和白名单 |
 | `allowed_users` | 允许使用的用户 ID（QQ 号等），一行一个 |
 | `allowed_groups` | 允许整群使用的群号，一行一个 |
+| `send_cooldown` | **同一用户两次发信的最小间隔（秒）**，默认 30；填 0 = 关掉冷却（v0.6.0） |
+| `send_daily_limit` | **每个用户每天最多发几封**，默认 50，按发送人统计、本地时间 0 点重置；填 0 = 不限制（v0.6.0） |
+| `audit_data_dir` | 发件审计库所在目录，**留空＝自动用 AstrBot 的 data 目录**；审计库不写插件仓库目录（v0.6.0） |
 | `poll_enabled` | 是否开启收信轮询（新邮件推到会话），默认关 |
 | `poll_interval` | 轮询间隔秒数，最小 60，默认 300 |
 | `notify_sessions` | 新邮件推送到哪些会话，用 `/mail here` 拿到的 ID，一行一个 |
@@ -66,14 +69,127 @@ WebUI → 插件 → AgentMail 邮件 → 配置：
 ## 指令
 
 ```
-/mail send <收件人> <主题> | <正文>
+/mail send <收件人> [--cc 抄送] [--bcc 密送] <主题> | <正文>
 /mail list [数量]
 /mail search <关键词> [数量]   # 搜历史邮件（主题/发件人/正文），默认 5 条、最多 20
 /mail read <message_id>
+/mail log [数量]      # 发件记录（成功/失败都记），默认 10 条、最多 50（v0.6.0）
 /mail whoami
 /mail here            # 打印当前会话 ID，填收信推送用
 /mail poll            # 手动跑一次收信轮询
 ```
+
+## 没权限时，会说清是什么挡的（v0.6.0）
+
+v0.5.x 被拦只有一句「这个会话没开邮件权限」，完全不知道自己撞了哪条规则、该找谁加什么。
+v0.6.0 起拒绝会直接给「原因 + 解决」，并且**日志里也记一条**（谁、哪个会话、被哪条规则挡）：
+
+```
+这个会话没有邮件权限，发不了。
+原因：allow_all 未开启，且你的 QQ 号 1150880493 不在 allowed_users 里，当前群 680787260 也不在 allowed_groups 里。
+解决：让管理员在 WebUI → 插件配置 → allowed_users 里加上 1150880493（只放开你），或把群号 680787260 填进 allowed_groups（整群可用）。
+```
+
+能区分的原因有四类：
+
+| 原因码 | 什么情况 | 文案里会告诉你 |
+| --- | --- | --- |
+| `not_whitelisted_dm` | 私聊：`allow_all` 关，你的号不在 `allowed_users` | 你的号该加进 `allowed_users`（并说明群白名单对私聊无效） |
+| `not_whitelisted_group` | 群聊：`allow_all` 关，你的号不在 `allowed_users`、群也不在 `allowed_groups` | 两条路都给：加你的号，或加群号 |
+| `not_whitelisted_no_id` | 拿不到用户 ID / 群号，没法比白名单 | 改用群号填 `allowed_groups` |
+| `allow_all_invalid` | `allow_all` 的值不是真布尔（手写成 `"off"`、`5`、`[]` 之类） | 指出类型不对、已按关闭处理、去 WebUI 选 true/false |
+
+> ℹ️ 顺带修掉一个坑：v0.5.x 的 `if self.conf.get("allow_all"):` 会把 `"false"` / `"off"` 这种
+> **非空字符串一律当「开」**，配置明明是关的却对所有人放开。v0.6.0 按真布尔判定，
+> 并把「类型不对」当成一条明确的拒绝原因报出来。
+
+管理员 / 白名单用户 / `allow_all` 打开，这四条放行路径都没变。指令和 LLM 工具
+（`agentmail_send`）用的是同一段文案，模型可以直接转述给用户。
+
+## 发件记录：`/mail log`（v0.6.0）
+
+每次发送都落一条审计，**成功和失败都记**（被限流拦下的也记，`结果=失败`，附原因）：
+
+```
+/mail log        # 最近 10 条，按时间倒序
+/mail log 3      # 最近 3 条（最多 50）
+```
+
+输出长这样：
+
+```
+📨 发件记录（最近 2 条，按时间倒序）
+2026-10-30 15:04:11 · ✅ 成功 · 私聊 1150880493 · 触发者 1150880493
+  发给：a@x.com（CC b@x.com）
+  主题：明天见 · 正文 12 字 · id：<010001...@email.amazonses.com>
+────────────
+2026-10-30 15:03:02 · ❌ 失败 · 群 680787260 · 触发者 1150880493
+  发给：c@d.com
+  主题：周报 · 正文 3 字
+  失败：HTTP 401：…
+```
+
+落库字段：时间、触发者、会话类型 / 会话 ID、UMO、收件人、CC、BCC、主题、正文长度、
+`message_id`、结果（成功/失败）、失败原因、耗时。
+
+存储实现：
+
+- **纯标准库 `sqlite3`**，`requirements.txt` 那条「纯标准库实现」没破
+- 文件在 **AstrBot 的 data 目录**：`<data>/plugin_data/astrbot_plugin_agentmail/mail_audit.sqlite3`
+  （找目录的顺序：`audit_data_dir` 配置 → `AGENTMAIL_DATA_DIR` / `ASTRBOT_DATA_DIR` 环境变量 →
+  `astrbot_path.get_astrbot_data_path()` → `<root>/data` → `./data` → `~/AstrBot/data` / `~/.astrbot/data` → 临时目录）
+- **绝不写插件仓库目录**：命中仓库路径的候选会被直接跳过（跑单测时 `./data` 就在仓库里，会被跳掉）
+- 审计库初始化 / 写入失败只记 warning，**发信不受影响**
+- `/mail log` 和其它指令一样走同一套权限闸门，没权限的人看不到
+
+## 发送限流（v0.6.0）
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `send_cooldown` | `30` | 同一用户两次发送的最小间隔（秒）。填 `0` = 关掉 |
+| `send_daily_limit` | `50` | 每个用户每天最多成功发几封（按发送人统计，本地时间 0 点重置）。填 `0` = 不限制 |
+
+超限不会只回一句「太频繁」，而是给剩余时间 / 剩余条数：
+
+```
+发得太快了，还要等 18 秒。
+原因：send_cooldown = 30 秒（同一个人两次发送之间至少隔 30 秒），上一次是 12 秒前发的。
+剩余：18 秒后可再发。
+解决：等 18 秒再发；或让管理员在 WebUI → 插件配置 → send_cooldown 里调小（填 0 = 关掉冷却）。
+```
+
+```
+今天已经发满 50 封了，现在发不了。
+原因：send_daily_limit = 50（每个用户每天最多成功发 50 封，按发送人统计）。
+剩余：0 封（今天已用 50/50），额度在明天 0 点（本地时间）重置。
+解决：明天再发；或让管理员在 WebUI → 插件配置 → send_daily_limit 里调大（填 0 = 关掉每日上限）。
+```
+
+几个约定：
+
+- **只统计成功发出去的那几封**：失败的那次不占冷却、不吃额度；被拦的那次也不会延长冷却（不然越急越自锁）
+- 两个都超时**优先报每日额度**（不然让人白等 20 秒冷却再被拒一次）
+- 限流按人算，一个人被拦不影响别人
+- 每天成功发一封后回执里会带一句「今日额度：剩 49/50 封」
+
+## CC / BCC（v0.6.0）
+
+**AgentMail 的发送接口原生支持 `cc` / `bcc`**，所以这里是**真 CC/BCC**，不是把地址拼进正文：
+
+```
+/mail send a@x.com --cc boss@x.com --bcc log@x.com 周报 | 正文…
+/mail send a@x.com,b@y.com --cc c@x.com,d@x.com 明天见 | 正文…
+```
+
+- 依据：`POST /v0/inboxes/{inbox_id}/messages/send` 的 `SendMessageRequest` 里就有
+  `cc`（Addresses，optional）和 `bcc`（Addresses，optional），Addresses = `string | list of string`，
+  见 <https://docs.agentmail.to/api-reference/inboxes/messages/send>
+- `--cc` / `--bcc` 后面跟着**像邮箱的 token**（含 `@`）才算地址，可以逗号分隔写多个，也可以连着写多个；
+  一旦不像邮箱就停手 —— 所以 `--cc a@b.com 明天见` 里的「明天见」不会被吃成抄送地址
+- 回执会明确写出 `CC：…（真 CC）` / `BCC：…（真 BCC，其他收件人看不到）`
+- **保底分支（不假装支持）**：如果某个老部署回 400/422 且明确抱怨 `cc`/`bcc` 字段，
+  插件会去掉这两个字段重发一次、把 CC/BCC 写进正文开头，并在回执里明说
+  「⚠️ 服务端不支持真 CC/BCC，已把 CC/BCC 写进正文开头。」；与 cc 无关的 400 照常抛错，不吞
 
 ## 搜索历史邮件（v0.4.0）
 
@@ -277,7 +393,9 @@ GET /v0/inboxes/{inbox}/messages/search?q=<关键词>&limit=<数量>
 | `404 Route not found` | base 路径不对；本项目用的是 `/v0`，不是 `/v1` |
 | `被网关拦截（返回 HTML 页面）` | 没连上 AgentMail，是本地网关吐的页面 → 配置里填 `proxy` |
 | `没有配置 AgentMail API Key` | 配置项 `api_key` 是空的，填完记得保存并重载插件 |
-| 群里发指令没反应 | 先看 `allow_all` / `allowed_groups` / 是否管理员；再确认这个会话没禁用 `/mail` 指令 |
+| 群里发指令没反应 | 先看 `allow_all` / `allowed_groups` / 是否管理员；再确认这个会话没禁用 `/mail` 指令。**v0.6.0 起拒绝会直接告诉你被哪条规则挡、该加什么**，日志关键字 `权限拒绝` |
+| `还要等 N 秒` / `今天已经发满 N 封了` | 撞了 v0.6.0 的发送限流：`send_cooldown` / `send_daily_limit`。等一会儿或让管理员调大（填 0 = 关掉） |
+| `/mail log` 说查不到记录 | 审计库没开起来，看插件日志里的 warning（一般是 data 目录不可写）；可以手动指定 `audit_data_dir` |
 | 只看到附件清单、没收到附件文件 | `notify_attachments` 没开；或平台不支持文件组件（日志里有「降级为纯文字清单重试」warning，清单里的信息照样是全的） |
 | 到点没收到每日摘要 | 看 `digest_enabled` 是否打开、`digest_sessions`（或 `notify_sessions`）是否填了会话 ID、`digest_time` 格式对不对；日志关键字「每日未读摘要」 |
 
@@ -326,15 +444,21 @@ git push origin v0.5.1
 ## 原理备忘
 
 ```
-/mail send ...  →  Mailer.send()  →  POST /v0/inboxes/{inbox}/messages/send
-                                     Authorization: Bearer <api_key>
+/mail send ...  →  权限（perm.py：放行/拒绝 + 原因）→ 限流（limits.py：冷却/每日额度）
+                →  Mailer.send()  →  POST /v0/inboxes/{inbox}/messages/send
+                                    （cc / bcc 是接口原生字段）
+                →  审计（audit.py：sqlite3 落一条）→  回执
+```
 
+```markdown
 收信推送 + 附件 → Mailer.list()           →  GET  /v0/inboxes/{inbox}/messages
                 → Mailer.attachment_info() →  GET  /v0/inboxes/{inbox}/messages/{id}/attachments/{aid}
                                              →  download_url（带签名、会过期，现取现用）
 
 每日未读摘要    → asyncio 定时（本地时间，同一天只推一次，日期存 KV）
                 → Mailer.list(50) → 未读计数 + 最新 3 封 → MessageChain([Plain]) → send_message
+
+/mail log       → audit.AuditLog.recent(n) → format_log_rows() → 纯文本回执
 ```
 
 接口文档：<https://docs.agentmail.to>（OpenAPI：<https://docs.agentmail.to/openapi.json>，注意路径是 `/v0`）

@@ -41,6 +41,24 @@
     "hint": "整群可用就填群号，一行一个",
     "default": []
   },
+  "send_cooldown": {
+    "description": "同一用户两次发信的最小间隔（秒）",
+    "type": "int",
+    "hint": "默认 30。超了会明确回「还要等 N 秒」，不会只回一句「太频繁」。填 0 = 关掉冷却",
+    "default": 30
+  },
+  "send_daily_limit": {
+    "description": "每个用户每天最多发几封",
+    "type": "int",
+    "hint": "默认 50，按发送人（QQ 号）统计，本地时间 0 点重置。超了会回「今天已发满 50 封，剩 0 封」。填 0 = 不限制",
+    "default": 50
+  },
+  "audit_data_dir": {
+    "description": "发件审计库所在目录（可留空）",
+    "type": "string",
+    "hint": "留空＝自动用 AstrBot 的 data 目录（<data>/plugin_data/astrbot_plugin_agentmail/mail_audit.sqlite3）。审计库不写插件仓库目录；想换位置就填一个可写目录",
+    "default": ""
+  },
   "poll_enabled": {
     "description": "开启收信轮询（新邮件推到指定会话）",
     "type": "bool",

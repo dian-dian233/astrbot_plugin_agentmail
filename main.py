@@ -1,9 +1,10 @@
 """AgentMail 邮件插件：让任何私聊 / 群聊都能发邮件、查收件箱，还能把新邮件推到指定会话。
 
 指令：
-    /mail send <收件人> <主题> | <正文>
+    /mail send <收件人> [--cc 抄送] [--bcc 密送] <主题> | <正文>
     /mail list [数量]
     /mail read <message_id>
+    /mail log [数量]      发件审计（v0.6.0）
     /mail whoami
     /mail here            打印当前会话的 unified_msg_origin（填收信推送用）
     /mail poll            手动跑一次收信轮询
@@ -25,6 +26,20 @@ v0.5.0 新增功能 B：每日未读摘要。新配置 digest_enabled（默认 f
             未读数量 + 最新 3 封的「时间 · 发件人 · 主题」推到目标会话；
             用本地时间判断、同一天只推一次（最后推送日期存插件 KV，重启也不重复），
             和收信轮询共用同一个 Mailer 实例。
+v0.6.0 新增 A：权限拒绝说清原因。`_allowed(event)` 换成 `_permission(event)`（逻辑在
+            perm.py，纯函数可单测）：放行给命中的规则名，拒绝给原因码 + 「原因：…」
+            「解决：…」两行，能自我修复（哪个号该加进 allowed_users、群号该填
+            allowed_groups、还是 allow_all 写成了非法布尔）；同时日志记一条
+            「谁 / 哪个会话 / 被哪条规则挡」。指令和 LLM 工具都用这一套。
+v0.6.0 新增 B：发件审计 + `/mail log [n]`。每次发送（成功 / 失败 / 被限流）都往
+            audit.py 的 sqlite3 库里落一条（时间、触发者、会话类型/ID、收件人、主题、
+            正文长度、message_id、结果），库放在 AstrBot 的 data 目录
+            （`<data>/plugin_data/astrbot_plugin_agentmail/mail_audit.sqlite3`），
+            **绝不写插件仓库目录**。`/mail log` 默认 10 条、按时间倒序，只给有权限的人看。
+v0.6.0 新增 C：发送限流 + CC/BCC。配置项 `send_cooldown`（默认 30 秒）/
+            `send_daily_limit`（每用户每天 50 封），超限回「还要等 N 秒」/「剩 0 封」，
+            不只说「太频繁」；`/mail send 收件人 --cc a@b --bcc c@d 主题 | 正文`
+            走 AgentMail 原生 cc/bcc 字段（真 CC/BCC，非正文拼接）。
 注意：`mail` 指令**不声明任何参数**，参数直接从 event.message_str 解析。
 AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当类型调用，
 直接抛 `_empty() takes no arguments`（v0.1.0 的坑，v0.1.1 修掉）。
@@ -33,6 +48,7 @@ AstrBot 的指令参数解析遇到 `*args` 会把 `inspect.Parameter.empty` 当
 import asyncio
 import contextlib
 import re
+import time
 from datetime import datetime
 
 import astrbot.api.message_components as Comp
@@ -48,7 +64,7 @@ try:  # 插件包内导入
         clip_text,
         extract_attachments,
     )
-    from .mailer import MailError, Mailer
+    from .audit import AuditLog, db_path, format_log_rows, resolve_data_dir
     from .digest import (
         DIGEST_FETCH,
         DIGEST_LATEST,
@@ -58,8 +74,19 @@ try:  # 插件包内导入
         next_check_delay,
         parse_time,
     )
+    from .limits import (
+        after_success,
+        check_send_limit,
+        format_limit_message,
+        format_quota_note,
+        read_cooldown,
+        read_daily_limit,
+    )
+    from .mailer import MailError, Mailer
     from .notify import render_notice
+    from .perm import evaluate as evaluate_permission
     from .search import format_rows, parse_search_args
+    from .sendargs import SendArgs, SendArgsError, parse_send_args
 except ImportError:  # 单独运行 / 被平铺加载时
     from attach import (  # type: ignore[no-redef]
         MAX_SEND_ATTACHMENTS,
@@ -68,6 +95,7 @@ except ImportError:  # 单独运行 / 被平铺加载时
         clip_text,
         extract_attachments,
     )
+    from audit import AuditLog, db_path, format_log_rows, resolve_data_dir  # type: ignore[no-redef]
     from digest import (  # type: ignore[no-redef]
         DIGEST_FETCH,
         DIGEST_LATEST,
@@ -77,16 +105,28 @@ except ImportError:  # 单独运行 / 被平铺加载时
         next_check_delay,
         parse_time,
     )
+    from limits import (  # type: ignore[no-redef]
+        after_success,
+        check_send_limit,
+        format_limit_message,
+        format_quota_note,
+        read_cooldown,
+        read_daily_limit,
+    )
     from mailer import MailError, Mailer  # type: ignore[no-redef]
     from notify import render_notice  # type: ignore[no-redef]
+    from perm import evaluate as evaluate_permission  # type: ignore[no-redef]
     from search import format_rows, parse_search_args  # type: ignore[no-redef]
+    from sendargs import SendArgs, SendArgsError, parse_send_args  # type: ignore[no-redef]
 
 HELP = """AgentMail 邮件工具
-· /mail send <收件人> <主题> | <正文>
+· /mail send <收件人> [--cc 抄送] [--bcc 密送] <主题> | <正文>
   例：/mail send 123@qq.com 明天见 | 我去不了，饭钱转你了
+  例：/mail send a@x.com --cc boss@x.com --bcc log@x.com 周报 | 正文…
 · /mail list [数量]   查收件箱
 · /mail search <关键词> [数量]  搜历史邮件（主题/发件人/正文，默认 5 条、最多 20）
 · /mail read <id>     看某一封
+· /mail log [数量]    看自己的发件记录（成功/失败都记，默认 10 条、最多 50）
 · /mail whoami        看当前邮箱和连通状态
 · /mail here          打印当前会话 ID（填「收信推送」用）
 · /mail poll          手动跑一次收信轮询"""
@@ -110,6 +150,7 @@ class AgentMailPlugin(Star):
         super().__init__(context)
         self.conf = config or {}
         self._mailer = None
+        self._audit = None
         self._poll_task = None
         self._digest_task = None
 
@@ -177,20 +218,109 @@ class AgentMailPlugin(Star):
             )
         return self._mailer
 
-    def _allowed(self, event) -> bool:
-        """白名单：allow_all / 管理员 / 指定用户 / 指定群。"""
-        if self.conf.get("allow_all"):
-            return True
+    @staticmethod
+    def _event_ids(event) -> tuple[str, str, str]:
+        """`(发送者 ID, 群号, unified_msg_origin)`，任何一项拿不到就给空串，不抛。"""
+        def _call(name):
+            fn = getattr(event, name, None)
+            if not callable(fn):
+                return ""
+            try:
+                return str(fn() or "")
+            except Exception:  # noqa: BLE001 老版本 / 某些平台没有这个方法
+                return ""
+
+        return _call("get_sender_id"), _call("get_group_id"), str(
+            getattr(event, "unified_msg_origin", "") or ""
+        )
+
+    def _permission(self, event):
+        """（v0.6.0 功能 A）带原因的权限判定，逻辑在 perm.py（纯函数、可单测）。"""
+        sender, group, umo = self._event_ids(event)
         try:
-            if event.is_admin():
-                return True
+            is_admin = bool(event.is_admin())
         except Exception:  # noqa: BLE001 老版本没有这个方法
-            pass
-        sender = str(event.get_sender_id() or "")
-        group = str(event.get_group_id() or "")
-        users = [str(x) for x in (self.conf.get("allowed_users") or [])]
-        groups = [str(x) for x in (self.conf.get("allowed_groups") or [])]
-        return bool((sender and sender in users) or (group and group in groups))
+            is_admin = False
+        return evaluate_permission(self.conf, sender=sender, group=group, umo=umo, is_admin=is_admin)
+
+    def _allowed(self, event) -> bool:
+        """白名单：allow_all / 管理员 / 指定用户 / 指定群（保留 bool 接口）。"""
+        return self._permission(event).allowed
+
+    def _deny_message(self, decision) -> str:
+        """拒绝时：日志记一条「谁 / 哪个会话 / 被哪条规则挡」，并把原因 + 解法回给用户。"""
+        logger.warning(f"[agentmail] 权限拒绝：{decision.detail}")
+        return decision.message
+
+    # ── 发件审计 + 限流（v0.6.0 功能 B / C） ──────────────────
+    def _audit_log(self):
+        """审计库（懒加载）。初始化失败只记 warning —— 审计坏掉绝不能让发信坏掉。"""
+        if self._audit is None:
+            try:
+                data_dir = resolve_data_dir(self.conf.get("audit_data_dir") or "", warn=logger.warning)
+                self._audit = AuditLog(db_path(data_dir))
+                logger.info(f"[agentmail] 发件审计库：{self._audit.path}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[agentmail] 审计库不可用（不影响发信）：{e}")
+                self._audit = False
+        return self._audit or None
+
+    def _record_send(self, event, args, *, ok, message_id="", error="", duration_ms=0):
+        """落一条审计；任何异常都只记 warning。"""
+        log = self._audit_log()
+        if log is None:
+            return
+        sender, group, umo = self._event_ids(event)
+        try:
+            log.record(
+                user_id=sender,
+                session_type="group" if group else "private",
+                session_id=group or sender,
+                umo=umo,
+                recipients=", ".join(getattr(args, "to", []) or []),
+                cc=", ".join(getattr(args, "cc", []) or []),
+                bcc=", ".join(getattr(args, "bcc", []) or []),
+                subject=getattr(args, "subject", "") or "",
+                body_len=len(getattr(args, "body", "") or ""),
+                message_id=message_id,
+                ok=ok,
+                error=error,
+                duration_ms=duration_ms,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[agentmail] 写审计失败（发信不受影响）：{e}")
+
+    def _send_gate(self, event) -> dict:
+        """（v0.6.0 功能 C）限流闸门：冷却 + 每日条数。
+
+        只统计「成功发出去」的记录，所以被拦的请求不会延长冷却、也不会吃掉额度。
+        审计库不可用时放行（记一条 warning），不能因为查不到历史就不让人发信。
+        """
+        cooldown = read_cooldown(self.conf.get("send_cooldown"))
+        daily = read_daily_limit(self.conf.get("send_daily_limit"))
+        now = time.time()
+        sender, _group, _umo = self._event_ids(event)
+        log = self._audit_log()
+        if log is None:
+            return check_send_limit(now=now, cooldown=cooldown, daily_limit=daily)
+        day_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        try:
+            stats = log.stats(sender, day_start)
+        except Exception as e:  # noqa: BLE001 查不到历史就放行，只在日志里留痕
+            logger.warning(f"[agentmail] 读审计失败，本次跳过限流：{e}")
+            return check_send_limit(now=now, cooldown=cooldown, daily_limit=daily)
+        return check_send_limit(
+            now=now, last_sent=stats["last"], used_today=stats["used"], cooldown=cooldown, daily_limit=daily
+        )
+
+    @staticmethod
+    def _log_block(event, gate):
+        sender, group, umo = AgentMailPlugin._event_ids(event)
+        logger.warning(
+            f"[agentmail] 发送被限流：user={sender or '?'} session={umo or '?'} group={group or '-'} "
+            f"reason={gate.get('reason')} used={gate.get('used')}/{gate.get('daily_limit')} "
+            f"retry_after={gate.get('retry_after')}s"
+        )
 
     @staticmethod
     def _args(event) -> str:
@@ -430,9 +560,10 @@ class AgentMailPlugin(Star):
     # 当成类型去调用，导致 `_empty() takes no arguments`。参数自己解析最省事。
     @filter.command("mail", alias={"邮件"})
     async def mail(self, event: AstrMessageEvent):
-        """AgentMail 邮件工具：发信 / 查收件箱 / 读邮件 / 收信推送。"""
-        if not self._allowed(event):
-            yield event.plain_result("这个会话没开邮件权限，找管理员把你的 QQ 或群号加进白名单。")
+        """AgentMail 邮件工具：发信 / 查收件箱 / 读邮件 / 发件记录 / 收信推送。"""
+        decision = self._permission(event)
+        if not decision.allowed:
+            yield event.plain_result(self._deny_message(decision))
             return
 
         text = self._args(event)
@@ -446,10 +577,49 @@ class AgentMailPlugin(Star):
 
         try:
             if action in ("send", "发", "发信", "发送"):
-                to, subject, body = self._parse_send(rest)
-                res = await asyncio.to_thread(self._mailer_or_raise().send, to, subject, body)
+                try:
+                    args = self._parse_send(rest)
+                except SendArgsError as e:
+                    yield event.plain_result(str(e))
+                    return
+                gate = self._send_gate(event)
+                if not gate["allowed"]:
+                    self._record_send(event, args, ok=False, error=f"限流：{gate['reason']}")
+                    self._log_block(event, gate)
+                    yield event.plain_result(format_limit_message(gate))
+                    return
+                started = time.monotonic()
+                try:
+                    res = await asyncio.to_thread(
+                        self._mailer_or_raise().send,
+                        args.to,
+                        args.subject,
+                        args.body,
+                        cc=args.cc,
+                        bcc=args.bcc,
+                    )
+                except MailError as e:
+                    self._record_send(
+                        event, args, ok=False, error=str(e),
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                    )
+                    raise
                 mid = res.get("message_id", "?")
-                yield event.plain_result(f"发出去了：{', '.join(to)}\n主题：{subject}\nid：{mid}")
+                self._record_send(
+                    event, args, ok=True, message_id=mid,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+                reply = f"发出去了：{', '.join(args.to)}\n主题：{args.subject}\nid：{mid}"
+                if args.cc:
+                    reply += f"\nCC：{', '.join(args.cc)}（真 CC）"
+                if args.bcc:
+                    reply += f"\nBCC：{', '.join(args.bcc)}（真 BCC，其他收件人看不到）"
+                if res.get("cc_fallback"):
+                    reply += "\n⚠️ 服务端不支持真 CC/BCC，已把 CC/BCC 写进正文开头。"
+                quota = format_quota_note(after_success(gate))
+                if quota:
+                    reply += f"\n{quota}"
+                yield event.plain_result(reply)
             elif action in ("list", "收件箱", "inbox"):
                 limit = int(rest) if rest.isdigit() else 5
                 msgs = await asyncio.to_thread(self._mailer_or_raise().list, limit)
@@ -457,6 +627,18 @@ class AgentMailPlugin(Star):
                     yield event.plain_result("收件箱是空的。")
                     return
                 yield event.plain_result(format_rows(msgs))
+            elif action in ("log", "日志", "记录"):
+                limit = int(rest) if rest.isdigit() else 10
+                log = self._audit_log()
+                if log is None:
+                    yield event.plain_result(
+                        "发件记录查不到：审计库没开起来（插件日志里有 warning，"
+                        "一般是 data 目录不可写）。发信本身不受影响。"
+                    )
+                    return
+                rows = await asyncio.to_thread(log.recent, limit)
+                total = await asyncio.to_thread(log.total)
+                yield event.plain_result(format_log_rows(rows, total))
             elif action in ("search", "搜", "搜索"):
                 keyword, limit = parse_search_args(rest)
                 if not keyword:  # 关键词为空 → 只回用法，不去查 API
@@ -514,22 +696,9 @@ class AgentMailPlugin(Star):
             yield event.plain_result(f"出错了：{e}")
 
     @staticmethod
-    def _parse_send(rest: str):
-        """解析 `收件人 主题 | 正文`，也兼容用换行分隔。"""
-        body = ""
-        if "|" in rest:
-            head, body = rest.split("|", 1)
-        elif "\n" in rest:
-            head, body = rest.split("\n", 1)
-        else:
-            head = rest
-        head = head.strip()
-        parts = head.split(None, 1)
-        if not parts:
-            raise MailError("用法：/mail send 收件人 主题 | 正文")
-        to = [x.strip() for x in parts[0].replace("，", ",").split(",") if x.strip()]
-        subject = parts[1].strip() if len(parts) > 1 else "(无主题)"
-        return to, subject, body.strip()
+    def _parse_send(rest: str) -> SendArgs:
+        """解析 `收件人 [--cc 抄送] [--bcc 密送] 主题 | 正文`（见 sendargs.py）。"""
+        return parse_send_args(rest)
 
     @staticmethod
     def _render_mail(m: dict) -> str:
@@ -554,10 +723,34 @@ class AgentMailPlugin(Star):
             subject(string): 邮件主题
             body(string): 邮件正文，纯文本
         """
-        if not self._allowed(event):
-            return "这个会话没有邮件权限，发不了。"
+        decision = self._permission(event)
+        if not decision.allowed:
+            # v0.6.0：不再只说「发不了」，把「原因 + 解决」原样给模型/用户
+            self._deny_message(decision)
+            return decision.message
+
+        args = SendArgs(to=[x.strip() for x in str(to or "").replace("，", ",").split(",") if x.strip()],
+                        cc=[], bcc=[], subject=subject or "", body=body or "")
+        gate = self._send_gate(event)
+        if not gate["allowed"]:
+            self._record_send(event, args, ok=False, error=f"限流：{gate['reason']}")
+            self._log_block(event, gate)
+            return format_limit_message(gate)
+
+        started = time.monotonic()
         try:
             res = await asyncio.to_thread(self._mailer_or_raise().send, to, subject, body)
-            return f"邮件已发出，收件人 {to}，主题「{subject}」，message_id={res.get('message_id', '?')}"
         except MailError as e:
+            self._record_send(
+                event, args, ok=False, error=str(e),
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
             return f"发送失败：{e}"
+        mid = res.get("message_id", "?")
+        self._record_send(
+            event, args, ok=True, message_id=mid,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        quota = format_quota_note(after_success(gate))
+        tail = f"（{quota}）" if quota else ""
+        return f"邮件已发出，收件人 {to}，主题「{subject}」，message_id={mid}{tail}"
