@@ -45,7 +45,7 @@ jobs:
       - name: 自测（离线，无凭证）
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 selftest.py --offline
+        run: python3 tests/selftest.py --offline
 
   manifest:
     name: manifest 体检
